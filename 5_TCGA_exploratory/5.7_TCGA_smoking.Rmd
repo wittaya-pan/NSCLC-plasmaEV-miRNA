@@ -1,0 +1,1387 @@
+---
+title: "Smoking Status & miRNA Expression — TCGA NSCLC"
+output: html_notebook
+---
+#check smoking column
+```{r}
+# ==============================================================================
+# Quick Extraction — tobacco_smoking_status & pack_year_smoked
+# Run this and paste the output back so we can confirm all category values
+# ==============================================================================
+
+# Load clinical RDS files
+luad_clin_raw <- readRDS("TCGA_LUAD_clinical.rds")
+lusc_clin_raw <- readRDS("TCGA_LUSC_clinical.rds")
+
+# ------------------------------------------------------------------------------
+# Check column names (confirm exact spelling)
+# ------------------------------------------------------------------------------
+
+cat("=== Columns containing 'smok' or 'pack' in LUAD ===\n")
+print(grep("smok|pack", colnames(luad_clin_raw), ignore.case = TRUE, value = TRUE))
+
+cat("\n=== Columns containing 'smok' or 'pack' in LUSC ===\n")
+print(grep("smok|pack", colnames(lusc_clin_raw), ignore.case = TRUE, value = TRUE))
+
+# ------------------------------------------------------------------------------
+# tobacco_smoking_status — all unique values + counts
+# ------------------------------------------------------------------------------
+
+cat("\n\n══════════════════════════════════════════════\n")
+cat("  tobacco_smoking_status — TCGA-LUAD\n")
+cat("══════════════════════════════════════════════\n")
+tbl_luad <- sort(table(luad_clin_raw$tobacco_smoking_status, useNA = "always"),
+                 decreasing = TRUE)
+for (i in seq_along(tbl_luad)) {
+  cat(sprintf("  %-50s  n = %d\n", names(tbl_luad)[i], tbl_luad[i]))
+}
+
+cat("\n══════════════════════════════════════════════\n")
+cat("  tobacco_smoking_status — TCGA-LUSC\n")
+cat("══════════════════════════════════════════════\n")
+tbl_lusc <- sort(table(lusc_clin_raw$tobacco_smoking_status, useNA = "always"),
+                 decreasing = TRUE)
+for (i in seq_along(tbl_lusc)) {
+  cat(sprintf("  %-50s  n = %d\n", names(tbl_lusc)[i], tbl_lusc[i]))
+}
+
+# ------------------------------------------------------------------------------
+# pack_year_smoked — summary statistics
+# ------------------------------------------------------------------------------
+
+cat("\n\n══════════════════════════════════════════════\n")
+cat("  pack_year_smoked — TCGA-LUAD\n")
+cat("══════════════════════════════════════════════\n")
+luad_py <- suppressWarnings(as.numeric(luad_clin_raw$pack_years_smoked))
+cat(sprintf("  n total     : %d\n", length(luad_py)))
+cat(sprintf("  n available : %d\n", sum(!is.na(luad_py))))
+cat(sprintf("  n NA        : %d\n", sum(is.na(luad_py))))
+if (sum(!is.na(luad_py)) > 0) {
+  cat("  Summary:\n")
+  print(summary(luad_py))
+}
+
+cat("\n══════════════════════════════════════════════\n")
+cat("  pack_year_smoked — TCGA-LUSC\n")
+cat("══════════════════════════════════════════════\n")
+lusc_py <- suppressWarnings(as.numeric(lusc_clin_raw$pack_years_smoked))
+cat(sprintf("  n total     : %d\n", length(lusc_py)))
+cat(sprintf("  n available : %d\n", sum(!is.na(lusc_py))))
+cat(sprintf("  n NA        : %d\n", sum(is.na(lusc_py))))
+if (sum(!is.na(lusc_py)) > 0) {
+  cat("  Summary:\n")
+  print(summary(lusc_py))
+}
+
+# ------------------------------------------------------------------------------
+# Cross-tabulation: smoking status vs pack_year availability
+# ------------------------------------------------------------------------------
+
+cat("\n\n══════════════════════════════════════════════\n")
+cat("  Cross-tab: smoking status vs pack_year (LUAD)\n")
+cat("══════════════════════════════════════════════\n")
+luad_clin_raw$py_available <- ifelse(is.na(luad_py), "pack_year = NA", "pack_year available")
+print(table(luad_clin_raw$tobacco_smoking_status,
+            luad_clin_raw$py_available, useNA = "always"))
+
+cat("\n══════════════════════════════════════════════\n")
+cat("  Cross-tab: smoking status vs pack_year (LUSC)\n")
+cat("══════════════════════════════════════════════\n")
+lusc_clin_raw$py_available <- ifelse(is.na(lusc_py), "pack_year = NA", "pack_year available")
+print(table(lusc_clin_raw$tobacco_smoking_status,
+            lusc_clin_raw$py_available, useNA = "always"))
+```
+
+
+
+#check expression miRNA in smoking status
+---
+title: "Smoking Status & miRNA Expression — TCGA NSCLC"
+output: html_notebook
+---
+
+```{r}
+# ==============================================================================
+# Smoking Status Exploration & miRNA Expression Analysis
+# TCGA-LUAD & TCGA-LUSC
+#
+# Signature miRNAs:
+#   hsa-miR-509-3p  (Risk factor,   β = +0.743)
+#   hsa-miR-377-3p  (Risk factor,   β = +0.503)
+#   hsa-miR-378h    (Protective,    β = −0.663)
+#
+# Pipeline:
+#   PART 0  — *** CLINICAL FIELD EXPLORER ***
+#             Prints ALL column names + sample values from clinical RDS.
+#             Run this first to confirm which smoking variables exist.
+#
+#   PART 1  — Define signature
+#   PART 2  — Load & inspect clinical data (smoking fields)
+#   PART 3  — Harmonise smoking status → Ever / Never / Unknown
+#   PART 4  — Smoking status demographics table
+#   PART 5  — Extract miRNA expression (tumor only, log2 RPM+1)
+#   PART 6  — Merge expression + smoking data
+#   PART 7  — Descriptive stats by smoking group
+#   PART 8  — Wilcoxon / Kruskal-Wallis tests (Ever vs Never)
+#   PART 9  — Violin + boxplots (Ever vs Never, per cohort + Pooled)
+#   PART 10 — 9-panel mega figure (3 miRNAs × 3 cohorts)
+#   PART 11 — Detailed smoking category plots (if pack-years available)
+#   PART 12 — Survival analysis: smoking group × risk group interaction
+#   PART 13 — Export summary CSVs
+# ==============================================================================
+
+library(TCGAbiolinks)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(patchwork)
+library(scales)
+
+# ==============================================================================
+# ── USER SETTINGS ──────────────────────────────────────────────────────────────
+# ==============================================================================
+
+# Clinical RDS files (downloaded by Script_TCGA_all_cohort, PART 0)
+RDS_LUAD_CLIN <- "TCGA_LUAD_clinical.rds"
+RDS_LUSC_CLIN <- "TCGA_LUSC_clinical.rds"
+
+# miRNA expression RDS files
+RDS_LUAD_MIR  <- "TCGA_LUAD_miRNA_df.rds"
+RDS_LUSC_MIR  <- "TCGA_LUSC_miRNA_df.rds"
+
+# Risk score CSVs (from Script_TCGA_all_cohort) — used for survival analysis
+# Set to NULL to skip survival part if files not yet available
+CSV_LUAD_RS   <- "TCGA_LUAD_risk_scores_3mir.csv"   # or NULL
+CSV_LUSC_RS   <- "TCGA_LUSC_risk_scores_3mir.csv"   # or NULL
+
+# Output directory
+OUT_DIR <- "Output_Smoking_miRNA"
+
+# Minimum n per smoking group to run statistics
+MIN_N_GROUP <- 10
+
+# ==============================================================================
+
+dir.create(OUT_DIR, showWarnings = FALSE)
+cat("Output directory:", OUT_DIR, "\n")
+
+# ==============================================================================
+# PART 0 — *** CLINICAL FIELD EXPLORER ***
+# Run this block to see ALL available columns in your clinical data.
+# This is the key diagnostic step — smoking variable names differ by
+# TCGA release / GDCquery_clinic version.
+# ==============================================================================
+
+cat("\n")
+cat("══════════════════════════════════════════════════════════════════\n")
+cat("  PART 0: CLINICAL FIELD EXPLORER\n")
+cat("══════════════════════════════════════════════════════════════════\n")
+
+explore_clinical <- function(rds_path, cohort_label) {
+
+  if (!file.exists(rds_path)) {
+    cat("  ✗ File not found:", rds_path, "\n")
+    cat("    → Set RUN_DOWNLOAD <- TRUE in Script_TCGA_all_cohort and re-run.\n")
+    return(invisible(NULL))
+  }
+
+  clin <- readRDS(rds_path)
+  cat("\n─── ", cohort_label, " ───\n")
+  cat("  Rows (patients):", nrow(clin), "\n")
+  cat("  Columns        :", ncol(clin), "\n\n")
+
+  # Print ALL column names with first non-NA example value
+  cat("  Column name                                  | Type       | Example value\n")
+  cat("  ", paste(rep("-", 80), collapse=""), "\n")
+  for (col in colnames(clin)) {
+    col_vals   <- clin[[col]]
+    col_type   <- class(col_vals)[1]
+    # First non-NA, non-empty value
+    ex_val <- col_vals[!is.na(col_vals) & col_vals != ""][1]
+    ex_str <- if (is.na(ex_val)) "<all NA>" else as.character(ex_val)
+    if (nchar(ex_str) > 40) ex_str <- paste0(substr(ex_str, 1, 37), "...")
+    cat(sprintf("  %-44s | %-10s | %s\n", col, col_type, ex_str))
+  }
+
+  # ── Specifically flag smoking-related columns ──
+  smoke_cols <- grep("smok|tobacco|pack|cigarette|nicotine",
+                     colnames(clin), ignore.case = TRUE, value = TRUE)
+  if (length(smoke_cols) > 0) {
+    cat("\n  *** SMOKING-RELATED COLUMNS DETECTED ***\n")
+    for (sc in smoke_cols) {
+      cat("\n  Column:", sc, "\n")
+      cat("  Unique values:\n")
+      uvals <- sort(unique(clin[[sc]]))
+      uvals <- uvals[!is.na(uvals)]
+      for (v in uvals) {
+        n <- sum(clin[[sc]] == v, na.rm = TRUE)
+        cat(sprintf("    %-45s  n = %d\n", as.character(v), n))
+      }
+      cat("  NA count:", sum(is.na(clin[[sc]])), "\n")
+    }
+  } else {
+    cat("\n  ⚠ No columns matching 'smok|tobacco|pack|cigarette|nicotine' found.\n")
+    cat("  → Check column list above for alternative variable names.\n")
+  }
+
+  invisible(clin)
+}
+
+luad_clin_raw <- explore_clinical(RDS_LUAD_CLIN, "TCGA-LUAD")
+lusc_clin_raw <- explore_clinical(RDS_LUSC_CLIN, "TCGA-LUSC")
+
+cat("\n══════════════════════════════════════════════════════════════════\n")
+cat("  Review the output above, then confirm SMOKING_COL below.\n")
+cat("  Common GDCquery_clinic column names:\n")
+cat("    cigarettes_per_day\n")
+cat("    years_smoked\n")
+cat("  ✓ Confirmed columns for this dataset:\n")
+cat("    tobacco_smoking_status   — smoking category (text labels)\n")
+cat("    pack_years_smoked        — numeric pack-years\n")
+cat("    tobacco_smoking_quit_year\n")
+cat("    tobacco_smoking_onset_year\n")
+cat("    alcohol_history\n")
+cat("══════════════════════════════════════════════════════════════════\n\n")
+
+# ==============================================================================
+# PART 1 — Signature definition
+# ==============================================================================
+
+SIG <- data.frame(
+  mature_name = c("hsa-miR-509-3p", "hsa-miR-377-3p", "hsa-miR-378h"),
+  log2_col    = c("log2_hsa_miR_509_3p", "log2_hsa_miR_377_3p", "log2_hsa_miR_378h"),
+  beta        = c( 0.743073677989302,  0.502724385364305, -0.663258691980459),
+  direction   = c("Risk (↑ = worse)", "Risk (↑ = worse)", "Protective (↑ = better)"),
+  stringsAsFactors = FALSE
+)
+
+mature_to_precursor <- list(
+  "hsa-miR-509-3p" = c("hsa-mir-509-1", "hsa-mir-509-2", "hsa-mir-509-3"),
+  "hsa-miR-377-3p" = c("hsa-mir-377"),
+  "hsa-miR-378h"   = c("hsa-mir-378h")
+)
+fallback_378 <- c("hsa-mir-378a","hsa-mir-378b","hsa-mir-378c",
+                  "hsa-mir-378d","hsa-mir-378e","hsa-mir-378f",
+                  "hsa-mir-378g","hsa-mir-378i")
+
+cat("=== 3-miRNA Signature ===\n")
+print(SIG[, c("mature_name","beta","direction")])
+
+# ==============================================================================
+# PART 2 — Load & inspect clinical data
+# ==============================================================================
+
+cat("\n── Part 2: Load clinical data ──\n")
+
+# ── IMPORTANT: After reviewing Part 0 output, set the correct column name ──
+# Default = "tobacco_smoking_history" (most common in GDCquery_clinic output)
+# Change if your data uses a different column name.
+
+SMOKING_COL    <- "tobacco_smoking_status"   # confirmed column name
+PACK_YEARS_COL <- "pack_years_smoked"           # confirmed column name
+
+# Coding key for tobacco_smoking_status (confirmed from your TCGA data):
+#
+#   NEVER:
+#     "Lifelong Non-Smoker"
+#
+#   EVER (all reformed + current):
+#     "Current Smoker"
+#     "Current Reformed Smoker for > 15 yrs"
+#     "Current Reformed Smoker for < or = 15 yrs"
+#     "Current Reformed Smoker, Duration Not Specified"
+#
+#   UNKNOWN (excluded from Ever vs Never comparison):
+#     "Not Reported"
+#     "Unknown"
+#     NA
+#
+#   Sample sizes (from your output):
+#     LUAD — Never=75, Ever=433, Unknown=14, NA=63
+#     LUSC — Never=18, Ever=474, Unknown=12, NA=0
+
+# Exact values confirmed from your TCGA clinical data output
+SMOKING_NEVER_CODES <- c(
+  "Lifelong Non-Smoker"   # only Never category in both LUAD & LUSC
+)
+
+# Exact values confirmed from your TCGA clinical data output
+SMOKING_EVER_CODES <- c(
+  "Current Smoker",
+  "Current Reformed Smoker for > 15 yrs",
+  "Current Reformed Smoker for < or = 15 yrs",
+  "Current Reformed Smoker, Duration Not Specified"
+)
+
+# Values mapped to Unknown (excluded from Ever/Never comparison)
+# "Not Reported", "Unknown", NA  → Unknown group
+
+load_clinical <- function(rds_path, cohort_label) {
+  if (!file.exists(rds_path)) {
+    cat("  ✗", rds_path, "not found\n"); return(NULL)
+  }
+  clin <- readRDS(rds_path)
+  clin$cohort <- cohort_label
+
+  # Standardise case_id to TCGA-XX-XXXX (12 chars, uppercase)
+  id_col <- if ("submitter_id" %in% colnames(clin)) "submitter_id" else
+            if ("bcr_patient_barcode" %in% colnames(clin)) "bcr_patient_barcode" else
+            colnames(clin)[1]
+  clin$case_id <- toupper(substr(clin[[id_col]], 1, 12))
+
+  cat("  ", cohort_label, "— n =", nrow(clin),
+      "| ID column used:", id_col, "\n")
+
+  if (SMOKING_COL %in% colnames(clin)) {
+    cat("  Smoking column '", SMOKING_COL, "' found.\n", sep = "")
+    cat("  Value counts:\n")
+    tbl <- sort(table(clin[[SMOKING_COL]], useNA = "ifany"), decreasing = TRUE)
+    for (i in seq_along(tbl)) {
+      cat(sprintf("    %-48s n = %d\n", names(tbl)[i], tbl[i]))
+    }
+  } else {
+    cat("  ⚠ Column '", SMOKING_COL, "' NOT found.\n", sep = "")
+    cat("    Available columns containing 'smok':\n")
+    sc <- grep("smok", colnames(clin), ignore.case = TRUE, value = TRUE)
+    cat("   ", paste(sc, collapse = ", "), "\n")
+    cat("    → Update SMOKING_COL above and re-run.\n")
+  }
+  clin
+}
+
+luad_clin <- load_clinical(RDS_LUAD_CLIN, "TCGA-LUAD")
+lusc_clin <- load_clinical(RDS_LUSC_CLIN, "TCGA-LUSC")
+
+# ==============================================================================
+# PART 3 — Harmonise smoking status → Ever / Never / Unknown
+# ==============================================================================
+
+cat("\n── Part 3: Harmonise smoking status ──\n")
+
+harmonise_smoking <- function(clin_df, cohort_label) {
+
+  if (is.null(clin_df)) return(NULL)
+
+  # ── Always guarantee these 3 columns exist before anything else ──────────
+  # This prevents downstream select() / left_join() errors regardless of
+  # whether SMOKING_COL is found or not.
+  if (!"smoking_raw"   %in% colnames(clin_df)) clin_df$smoking_raw   <- NA_character_
+  if (!"smoking_group" %in% colnames(clin_df)) clin_df$smoking_group <- NA_character_
+  if (!"pack_years"    %in% colnames(clin_df)) clin_df$pack_years    <- NA_real_
+
+  if (!SMOKING_COL %in% colnames(clin_df)) {
+    cat("  ⚠ SMOKING_COL '", SMOKING_COL, "' NOT found in ", cohort_label, ".\n", sep="")
+
+    # Auto-detect any smoking-related column and suggest it
+    smoke_candidates <- grep("smok|tobacco|cigarette|nicotine",
+                              colnames(clin_df), ignore.case = TRUE, value = TRUE)
+    if (length(smoke_candidates) > 0) {
+      cat("  → Possible smoking columns detected — update SMOKING_COL to one of:\n")
+      for (sc in smoke_candidates) {
+        uv <- as.character(sort(unique(clin_df[[sc]])))
+        uv <- uv[!is.na(uv)][seq_len(min(5, sum(!is.na(uv))))]
+        cat(sprintf("      %-45s  e.g. %s\n", sc, paste(uv, collapse=", ")))
+      }
+    } else {
+      cat("  → No smoking-related columns found at all.\n")
+      cat("  → Re-run PART 0 to inspect all clinical column names.\n")
+    }
+    # Return with NA smoking columns — downstream loops will skip gracefully
+    return(clin_df)
+  }
+
+  raw <- clin_df[[SMOKING_COL]]
+
+  clin_df$smoking_raw   <- as.character(raw)
+  clin_df$smoking_group <- dplyr::case_when(
+    raw %in% SMOKING_NEVER_CODES                          ~ "Never",
+    raw %in% SMOKING_EVER_CODES                           ~ "Ever",
+    is.na(raw) | raw == "" | raw == "Not Available" |
+      raw == "Unknown" | raw == "[Unknown]" |
+      raw == "[Not Available]"                            ~ "Unknown",
+    TRUE                                                  ~ "Unknown"
+  )
+
+  cat("\n  ", cohort_label, "— smoking_group distribution:\n")
+  tbl <- table(clin_df$smoking_group, useNA = "ifany")
+  for (nm in names(tbl)) {
+    cat(sprintf("    %-10s  n = %d  (%.1f%%)\n",
+                nm, tbl[nm], 100 * tbl[nm] / nrow(clin_df)))
+  }
+
+  # Extract pack-years if available
+  # Use confirmed column name directly
+  if (PACK_YEARS_COL %in% colnames(clin_df)) {
+    clin_df$pack_years <- suppressWarnings(as.numeric(clin_df[[PACK_YEARS_COL]]))
+    n_py <- sum(!is.na(clin_df$pack_years))
+    cat("  Pack-years column '", PACK_YEARS_COL, "' found — n available =", n_py, "\n")
+    py_ever <- clin_df$pack_years[clin_df$smoking_group == "Ever"]
+    if (sum(!is.na(py_ever)) > 0) {
+      cat("  Pack-years summary (Ever smokers):\n")
+      cat("   ", paste(capture.output(summary(py_ever)), collapse = "\n    "), "\n")
+    }
+  } else {
+    cat("  ⚠ Pack-years column '", PACK_YEARS_COL, "' not found — pack_years set to NA.\n")
+  }
+
+  clin_df
+}
+
+luad_clin <- harmonise_smoking(luad_clin, "TCGA-LUAD")
+lusc_clin <- harmonise_smoking(lusc_clin, "TCGA-LUSC")
+
+# ==============================================================================
+# PART 4 — Smoking demographics table
+# ==============================================================================
+
+cat("\n── Part 4: Demographics table ──\n")
+
+make_demo_table <- function(clin_df, cohort_label) {
+  if (is.null(clin_df)) return(NULL)
+
+  # Columns to summarise if present
+  demo_vars <- c("gender", "race", "ethnicity", "age_at_diagnosis",
+                 "ajcc_pathologic_stage", "ajcc_pathologic_t",
+                 "ajcc_pathologic_n", "primary_diagnosis",
+                 "pack_years", "smoking_raw")
+
+  demo_vars <- demo_vars[demo_vars %in% colnames(clin_df)]
+
+  cat("\n  === ", cohort_label, " Demographics by Smoking Group ===\n")
+  cat("  Total n =", nrow(clin_df), "\n\n")
+
+  for (var in demo_vars) {
+    vals <- clin_df[[var]]
+    cat("  Variable:", var, "\n")
+    if (is.numeric(vals)) {
+      cat("  By smoking group (median [IQR]):\n")
+      for (grp in c("Never", "Ever", "Unknown")) {
+        v <- vals[clin_df$smoking_group == grp & !is.na(clin_df$smoking_group)]
+        v <- v[!is.na(v)]
+        if (length(v) > 0) {
+          q <- quantile(v, c(0.25, 0.50, 0.75), na.rm = TRUE)
+          cat(sprintf("    %-10s  n=%d  median=%.1f [%.1f–%.1f]\n",
+                      grp, length(v), q[2], q[1], q[3]))
+        }
+      }
+    } else {
+      tbl2 <- table(clin_df$smoking_group, vals, useNA = "no")
+      print(tbl2)
+    }
+    cat("\n")
+  }
+
+  # Summary count table
+  smk_tbl <- clin_df %>%
+    count(smoking_group) %>%
+    mutate(pct = round(100 * n / sum(n), 1),
+           cohort = cohort_label) %>%
+    select(cohort, smoking_group, n, pct)
+  smk_tbl
+}
+
+demo_luad <- make_demo_table(luad_clin, "TCGA-LUAD")
+demo_lusc <- make_demo_table(lusc_clin, "TCGA-LUSC")
+
+if (!is.null(demo_luad) && !is.null(demo_lusc)) {
+  demo_all <- bind_rows(demo_luad, demo_lusc)
+  cat("\n  === Combined Smoking Status Summary ===\n")
+  print(demo_all, row.names = FALSE)
+  write.csv(demo_all,
+            file.path(OUT_DIR, "Smoking_Demographics_Summary.csv"),
+            row.names = FALSE)
+  cat("✓ Saved: Smoking_Demographics_Summary.csv\n")
+}
+
+# ==============================================================================
+# PART 5 — Extract miRNA expression (tumor samples only)
+# ==============================================================================
+
+cat("\n── Part 5: Extract miRNA expression (tumor only) ──\n")
+
+extract_tumor_expr <- function(rds_path, cohort_label) {
+
+  if (!file.exists(rds_path)) {
+    cat("  ✗", rds_path, "not found\n"); return(NULL)
+  }
+
+  mirna_df <- readRDS(rds_path)
+  cat("  ", cohort_label, "— RDS loaded:", nrow(mirna_df), "miRNA rows\n")
+
+  rpm_cols           <- grep("^reads_per_million_miRNA_mapped_TCGA-",
+                              colnames(mirna_df), value = TRUE)
+  expr_rpm           <- as.matrix(mirna_df[, rpm_cols])
+  mode(expr_rpm)     <- "numeric"
+  rownames(expr_rpm) <- mirna_df$miRNA_ID
+  barcodes           <- sub("^reads_per_million_miRNA_mapped_", "", rpm_cols)
+  colnames(expr_rpm) <- barcodes
+
+  # Tumor (01) only
+  stype    <- substr(barcodes, 14, 15)
+  keep     <- stype == "01"
+  expr_rpm <- expr_rpm[, keep, drop = FALSE]
+  barcodes <- barcodes[keep]
+  case_ids <- toupper(substr(barcodes, 1, 12))
+
+  # Deduplicate
+  dup      <- duplicated(case_ids)
+  expr_rpm <- expr_rpm[, !dup, drop = FALSE]
+  case_ids <- case_ids[!dup]
+
+  cat("  Tumor samples (deduplicated):", length(case_ids), "\n")
+
+  # Precursor → mature with 378h fallback
+  local_map <- mature_to_precursor
+  for (mature in names(local_map)) {
+    prec  <- local_map[[mature]]
+    found <- prec[prec %in% rownames(expr_rpm)]
+    if (length(found) > 0) {
+      local_map[[mature]] <- found
+    } else if (mature == "hsa-miR-378h") {
+      fb <- fallback_378[fallback_378 %in% rownames(expr_rpm)]
+      local_map[[mature]] <- if (length(fb) > 0) fb else character(0)
+    } else {
+      local_map[[mature]] <- character(0)
+    }
+  }
+
+  # Collapse + log2 transform
+  expr_sig <- do.call(rbind, lapply(names(local_map), function(mature) {
+    prec <- local_map[[mature]]
+    if (length(prec) == 0) {
+      row <- matrix(NA_real_, 1, ncol(expr_rpm)); rownames(row) <- mature
+      return(row)
+    }
+    row <- if (length(prec) == 1) expr_rpm[prec, , drop=FALSE]
+           else matrix(colSums(expr_rpm[prec,,drop=FALSE], na.rm=TRUE), 1)
+    rownames(row) <- mature; row
+  }))
+  log2_sig <- log2(expr_sig + 1)
+
+  # Build data frame
+  result <- data.frame(case_id = case_ids, cohort = cohort_label,
+                       stringsAsFactors = FALSE)
+  for (mature in rownames(log2_sig)) {
+    col_nm          <- paste0("log2_", gsub("-", "_", mature))
+    result[[col_nm]] <- as.numeric(log2_sig[mature, ])
+  }
+
+  cat("  Zero rate check:\n")
+  for (col in SIG$log2_col) {
+    if (col %in% colnames(result)) {
+      zr <- round(100 * mean(result[[col]] == 0, na.rm = TRUE), 1)
+      cat(sprintf("    %-35s  zero = %.1f%%\n", col, zr))
+    }
+  }
+  result
+}
+
+luad_expr <- extract_tumor_expr(RDS_LUAD_MIR, "TCGA-LUAD")
+lusc_expr <- extract_tumor_expr(RDS_LUSC_MIR, "TCGA-LUSC")
+
+# ==============================================================================
+# PART 6 — Merge expression + smoking data
+# ==============================================================================
+
+cat("\n── Part 6: Merge expression + smoking data ──\n")
+
+merge_expr_smoking <- function(expr_df, clin_df, cohort_label) {
+  if (is.null(expr_df) || is.null(clin_df)) return(NULL)
+
+  # Use any_of() for ALL clinical columns so missing ones are silently skipped
+  clin_sub <- clin_df %>%
+    select(any_of(c("case_id", "smoking_group", "smoking_raw", "pack_years",
+                    "gender", "age_at_diagnosis", "ajcc_pathologic_stage",
+                    "primary_diagnosis"))) %>%
+    filter(!is.na(case_id))
+
+  # Ensure smoking_group exists in clin_sub (may be absent if harmonise failed)
+  if (!"smoking_group" %in% colnames(clin_sub)) clin_sub$smoking_group <- NA_character_
+  if (!"smoking_raw"   %in% colnames(clin_sub)) clin_sub$smoking_raw   <- NA_character_
+  if (!"pack_years"    %in% colnames(clin_sub)) clin_sub$pack_years    <- NA_real_
+
+  merged <- expr_df %>%
+    left_join(clin_sub, by = "case_id")
+
+  n_matched <- sum(!is.na(merged$smoking_group))
+  pct       <- if (nrow(merged) > 0)
+    round(100 * n_matched / nrow(merged), 1) else 0
+
+  cat(sprintf("  %s — expr n=%d | clin n=%d | matched=%d (%.1f%%)\n",
+              cohort_label, nrow(expr_df), nrow(clin_df), n_matched, pct))
+
+  if (n_matched == 0) {
+    cat("  ⚠ Zero matches! Check case_id format in both data frames.\n")
+    cat("    expr  case_id example:", head(expr_df$case_id, 3), "\n")
+    cat("    clin  case_id example:", head(clin_df$case_id,  3), "\n")
+  }
+
+  merged
+}
+
+luad_merged <- merge_expr_smoking(luad_expr, luad_clin, "TCGA-LUAD")
+lusc_merged <- merge_expr_smoking(lusc_expr, lusc_clin, "TCGA-LUSC")
+
+# Pooled
+pooled_merged <- bind_rows(luad_merged, lusc_merged) %>%
+  mutate(cohort = "LUAD+LUSC (Pooled)")
+
+# All three cohorts together for downstream loops
+all_merged <- bind_rows(luad_merged, lusc_merged, pooled_merged) %>%
+  mutate(
+    smoking_group = factor(smoking_group, levels = c("Never", "Ever", "Unknown")),
+    cohort        = factor(cohort,
+                           levels = c("TCGA-LUAD","TCGA-LUSC","LUAD+LUSC (Pooled)"))
+  )
+
+cat("\n  Final counts by cohort × smoking group:\n")
+print(all_merged %>% filter(cohort != "LUAD+LUSC (Pooled)") %>%
+        count(cohort, smoking_group))
+
+# ==============================================================================
+# PART 7 — Descriptive statistics by smoking group
+# ==============================================================================
+
+cat("\n── Part 7: Descriptive statistics ──\n")
+
+log2_cols_present <- SIG$log2_col[SIG$log2_col %in% colnames(all_merged)]
+
+long_smk <- all_merged %>%
+  pivot_longer(cols      = all_of(log2_cols_present),
+               names_to  = "log2_col",
+               values_to = "log2_expr") %>%
+  left_join(SIG %>% select(log2_col, mature_name, beta, direction),
+            by = "log2_col") %>%
+  filter(!is.na(log2_expr), smoking_group %in% c("Never", "Ever"))
+
+desc_smk <- long_smk %>%
+  group_by(cohort, mature_name, smoking_group) %>%
+  summarise(
+    n        = n(),
+    mean     = round(mean(log2_expr,   na.rm = TRUE), 4),
+    median   = round(median(log2_expr, na.rm = TRUE), 4),
+    sd       = round(sd(log2_expr,     na.rm = TRUE), 4),
+    q25      = round(quantile(log2_expr, 0.25, na.rm = TRUE), 4),
+    q75      = round(quantile(log2_expr, 0.75, na.rm = TRUE), 4),
+    zero_pct = round(100 * mean(log2_expr == 0, na.rm = TRUE), 1),
+    .groups  = "drop"
+  )
+
+cat("\n═══ Descriptive Stats — Ever vs Never ═══\n")
+print(desc_smk, n = 50)
+
+write.csv(desc_smk,
+          file.path(OUT_DIR, "Descriptive_Stats_Smoking.csv"),
+          row.names = FALSE)
+cat("✓ Saved: Descriptive_Stats_Smoking.csv\n")
+
+# ==============================================================================
+# PART 8 — Statistical tests: Ever vs Never
+# ==============================================================================
+
+cat("\n── Part 8: Wilcoxon tests (Ever vs Never) ──\n")
+
+wilcox_smk <- long_smk %>%
+  group_by(cohort, mature_name) %>%
+  summarise({
+    grp    <- split(log2_expr, smoking_group)
+    never  <- grp[["Never"]]
+    ever   <- grp[["Ever"]]
+
+    if (length(never) < MIN_N_GROUP || length(ever) < MIN_N_GROUP) {
+      tibble(
+        n_never = length(never), n_ever = length(ever),
+        median_never = NA_real_, median_ever = NA_real_,
+        W = NA_real_, p_value = NA_real_, p_adj_BH = NA_real_,
+        significance = "Insufficient n",
+        fold_change_ever_vs_never = NA_real_
+      )
+    } else {
+      wt <- wilcox.test(ever, never, exact = FALSE)
+      tibble(
+        n_never               = length(never),
+        n_ever                = length(ever),
+        median_never          = round(median(never, na.rm = TRUE), 4),
+        median_ever           = round(median(ever,  na.rm = TRUE), 4),
+        W                     = round(wt$statistic, 1),
+        p_value               = wt$p.value,
+        p_adj_BH              = NA_real_,
+        significance          = "",
+        # Difference in log2 space = log2 fold-change proxy
+        fold_change_ever_vs_never = round(median(ever,  na.rm = TRUE) -
+                                          median(never, na.rm = TRUE), 4)
+      )
+    }
+  }, .groups = "drop")
+
+# BH correction
+valid <- !is.na(wilcox_smk$p_value)
+wilcox_smk$p_adj_BH[valid] <- p.adjust(wilcox_smk$p_value[valid], method = "BH")
+
+wilcox_smk <- wilcox_smk %>%
+  mutate(
+    significance = case_when(
+      is.na(p_adj_BH)  ~ "Insufficient n",
+      p_adj_BH < 0.001 ~ "***",
+      p_adj_BH < 0.01  ~ "**",
+      p_adj_BH < 0.05  ~ "*",
+      TRUE             ~ "ns"
+    ),
+    p_value  = formatC(p_value,  digits = 4, format = "g"),
+    p_adj_BH = formatC(p_adj_BH, digits = 4, format = "g")
+  )
+
+cat("\n═══ Wilcoxon Results — Ever vs Never ═══\n")
+print(wilcox_smk, n = 30)
+
+write.csv(wilcox_smk,
+          file.path(OUT_DIR, "Wilcoxon_Smoking_EverVsNever.csv"),
+          row.names = FALSE)
+cat("✓ Saved: Wilcoxon_Smoking_EverVsNever.csv\n")
+
+# ==============================================================================
+# PART 9 — Colour palette & theme
+# ==============================================================================
+
+COL_NEVER  <- "#2166AC"   # blue  — Never smoker
+COL_EVER   <- "#B2182B"   # red   — Ever smoker
+COL_UNK    <- "#999999"   # grey  — Unknown
+SMOKE_PAL  <- c("Never" = COL_NEVER, "Ever" = COL_EVER, "Unknown" = COL_UNK)
+
+base_theme <- theme_bw(base_size = 11) +
+  theme(
+    plot.title        = element_text(face = "bold", size = 12),
+    plot.subtitle     = element_text(size = 9, color = "grey30"),
+    strip.background  = element_rect(fill = "grey92", color = "grey60"),
+    strip.text        = element_text(face = "bold", size = 10),
+    legend.position   = "none",
+    panel.grid.minor  = element_blank(),
+    axis.title        = element_text(size = 10),
+    axis.text         = element_text(size = 9)
+  )
+
+# ==============================================================================
+# PART 9 — Violin + boxplot: Ever vs Never per cohort
+# ==============================================================================
+
+cat("\n── Part 9: Violin + box plots per cohort ──\n")
+
+for (coh in levels(all_merged$cohort)) {
+
+  df_coh <- long_smk %>%
+    filter(cohort == coh, smoking_group %in% c("Never", "Ever")) %>%
+    mutate(smoking_group = factor(smoking_group, levels = c("Never", "Ever")))
+
+  if (nrow(df_coh) < MIN_N_GROUP) next
+
+  # Annotation data
+  wt_coh <- wilcox_smk %>%
+    filter(cohort == coh) %>%
+    select(mature_name, significance, p_adj_BH)
+
+  y_max_df <- df_coh %>%
+    group_by(mature_name) %>%
+    summarise(y_max = max(log2_expr, na.rm = TRUE) * 1.13, .groups = "drop")
+
+  annot_df <- wt_coh %>%
+    left_join(y_max_df, by = "mature_name") %>%
+    mutate(x = 1.5,
+           label = paste0("p.adj = ", p_adj_BH, "\n", significance))
+
+  p_vio <- ggplot(df_coh,
+                  aes(x = smoking_group, y = log2_expr, fill = smoking_group)) +
+    geom_violin(trim = FALSE, alpha = 0.55, linewidth = 0.4) +
+    geom_boxplot(width = 0.18, outlier.size = 0.8, outlier.alpha = 0.4,
+                 linewidth = 0.5, fill = "white", alpha = 0.8) +
+    geom_text(data = annot_df,
+              aes(x = x, y = y_max, label = label),
+              inherit.aes = FALSE,
+              size = 3.2, color = "grey20", fontface = "italic", hjust = 0.5) +
+    scale_fill_manual(values = SMOKE_PAL) +
+    facet_wrap(~ mature_name, scales = "free_y", nrow = 1) +
+    labs(
+      title    = paste0(coh, " — miRNA Expression: Never vs Ever Smoker"),
+      subtitle = "log2(RPM + 1)  |  Wilcoxon rank-sum  |  BH-adjusted p-value  |  Tumor samples only",
+      x        = "Smoking Status",
+      y        = "Expression  [log2(RPM + 1)]"
+    ) +
+    base_theme
+
+  coh_slug <- gsub("[^A-Za-z0-9]", "_", coh)
+  out_f    <- file.path(OUT_DIR, paste0("Violin_Smoking_NeverVsEver_", coh_slug, ".png"))
+  png(out_f, width = 3000, height = 2000, res = 300)
+  print(p_vio)
+  dev.off()
+  cat("  Saved:", out_f, "\n")
+}
+
+# ==============================================================================
+# PART 10 — 9-panel mega figure (3 miRNAs × 3 cohorts)
+# ==============================================================================
+
+cat("\n── Part 10: 9-panel mega figure ──\n")
+
+make_smoke_panel <- function(df_sub, title_str, subtitle_str, p_lbl, y_top) {
+  ggplot(df_sub,
+         aes(x = x_lab, y = log2_expr, fill = smoking_group)) +
+    geom_violin(trim = FALSE, alpha = 0.50, linewidth = 0.35) +
+    geom_boxplot(width = 0.15, outlier.size = 0.6, outlier.alpha = 0.35,
+                 linewidth = 0.45, fill = "white", alpha = 0.85) +
+    annotate("text", x = 1.5, y = y_top * 1.10, label = p_lbl,
+             size = 2.6, color = "grey25", fontface = "italic") +
+    scale_fill_manual(values = SMOKE_PAL) +
+    labs(title = title_str, subtitle = subtitle_str,
+         x = NULL, y = "log2(RPM + 1)") +
+    theme_bw(base_size = 9) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 9),
+      plot.subtitle    = element_text(size = 7.5, color = "grey20", face = "italic"),
+      legend.position  = "none",
+      panel.grid.minor = element_blank(),
+      axis.text        = element_text(size = 7.5)
+    )
+}
+
+COHORT_ORDER <- c("TCGA-LUAD", "TCGA-LUSC", "LUAD+LUSC (Pooled)")
+mega_list    <- list()
+
+for (mir in SIG$mature_name) {
+  for (coh in COHORT_ORDER) {
+
+    df_sub <- long_smk %>%
+      filter(cohort == coh, mature_name == mir,
+             smoking_group %in% c("Never","Ever")) %>%
+      mutate(smoking_group = factor(smoking_group, levels = c("Never","Ever")))
+
+    if (nrow(df_sub) < 5) { mega_list[[paste(mir, coh)]] <- NULL; next }
+
+    wt_row <- wilcox_smk %>% filter(cohort == coh, mature_name == mir)
+    sig_lb <- if (nrow(wt_row) == 0) "" else wt_row$significance[1]
+    p_lbl  <- if (nrow(wt_row) == 0) "" else
+      paste0("p.adj=", wt_row$p_adj_BH[1], "  ", sig_lb)
+
+    n_labs <- df_sub %>%
+      group_by(smoking_group) %>%
+      summarise(n = n(), .groups = "drop") %>%
+      mutate(x_lab = paste0(smoking_group, "\n(n=", n, ")")) %>%
+      { setNames(.$x_lab, as.character(.$smoking_group)) }
+
+    df_sub <- df_sub %>%
+      mutate(x_lab = factor(n_labs[as.character(smoking_group)],
+                            levels = n_labs[c("Never","Ever")]))
+
+    y_top <- max(df_sub$log2_expr, na.rm = TRUE)
+
+    mega_list[[paste(mir, coh)]] <- make_smoke_panel(
+      df_sub,
+      title_str    = coh,
+      subtitle_str = mir,
+      p_lbl        = p_lbl,
+      y_top        = y_top
+    )
+  }
+}
+
+mega_list <- Filter(Negate(is.null), mega_list)
+
+if (length(mega_list) >= 2) {
+  mega_panel <- wrap_plots(mega_list, ncol = 3) +
+    plot_annotation(
+      title    = "miRNA Expression: Never vs Ever Smoker — 3-miRNA Signature",
+      subtitle = paste0(
+        "log2(RPM + 1)  ·  Wilcoxon rank-sum  ·  BH-adjusted p-value  ·  Tumor samples only\n",
+        "Columns: TCGA-LUAD  |  TCGA-LUSC  |  LUAD+LUSC Pooled",
+        "     Rows: hsa-miR-509-3p  |  hsa-miR-377-3p  |  hsa-miR-378h"
+      ),
+      theme = theme(
+        plot.title    = element_text(face = "bold", size = 15),
+        plot.subtitle = element_text(color = "grey35", size = 9.5)
+      )
+    )
+
+  out_mega <- file.path(OUT_DIR, "Panel_Smoking_3miRNA_9plots_AllCohorts.png")
+  png(out_mega, width = 5400, height = 5400, res = 300)
+  print(mega_panel)
+  dev.off()
+  cat("  Saved:", out_mega, "\n")
+}
+
+# ==============================================================================
+# PART 11 — Pack-years correlation: scatter plots + Spearman statistics
+#           Per cohort (LUAD, LUSC) AND Pooled (LUAD+LUSC combined)
+#           All Ever smokers with available pack_years data
+#           Also includes ALL smokers (Ever only) with cohort colour coding
+# ==============================================================================
+
+cat("\n── Part 11: Pack-years correlation (LUAD / LUSC / Pooled) ──\n")
+
+# ── 11A: Check availability ───────────────────────────────────────────────────
+py_check <- all_merged %>%
+  filter(cohort != "LUAD+LUSC (Pooled)", !is.na(pack_years),
+         smoking_group == "Ever")
+
+cat(sprintf("  Pack-years available — LUAD: %d | LUSC: %d | Total: %d\n",
+    sum(py_check$cohort == "TCGA-LUAD"),
+    sum(py_check$cohort == "TCGA-LUSC"),
+    nrow(py_check)))
+
+if (nrow(py_check) < MIN_N_GROUP) {
+  cat("  Insufficient pack-years data — skipping correlation plots.\n")
+} else {
+
+  # ── 11B: Spearman correlation statistics table ──────────────────────────────
+  cat("\n  Computing Spearman correlations...\n")
+
+  # Run for all 3 cohort levels including Pooled
+  corr_cohorts <- list(
+    "TCGA-LUAD"          = all_merged %>%
+                             filter(cohort == "TCGA-LUAD",
+                                    smoking_group == "Ever", !is.na(pack_years)),
+    "TCGA-LUSC"          = all_merged %>%
+                             filter(cohort == "TCGA-LUSC",
+                                    smoking_group == "Ever", !is.na(pack_years)),
+    "LUAD+LUSC (Pooled)" = all_merged %>%
+                             filter(cohort %in% c("TCGA-LUAD","TCGA-LUSC"),
+                                    smoking_group == "Ever", !is.na(pack_years))
+  )
+
+  spearman_rows <- bind_rows(lapply(names(corr_cohorts), function(coh_name) {
+    df_c <- corr_cohorts[[coh_name]]
+    if (nrow(df_c) < MIN_N_GROUP) return(NULL)
+
+    bind_rows(lapply(log2_cols_present, function(lcol) {
+      mir_name <- SIG$mature_name[SIG$log2_col == lcol]
+      vals     <- df_c[[lcol]]
+      py_vals  <- df_c$pack_years
+      complete <- !is.na(vals) & !is.na(py_vals)
+
+      if (sum(complete) < MIN_N_GROUP) return(NULL)
+
+      ct <- cor.test(py_vals[complete], vals[complete],
+                     method = "spearman", exact = FALSE)
+      data.frame(
+        Cohort      = coh_name,
+        miRNA       = mir_name,
+        n           = sum(complete),
+        rho         = round(ct$estimate, 4),
+        p_value     = ct$p.value,
+        p_adj_BH    = NA_real_,
+        stringsAsFactors = FALSE
+      )
+    }))
+  }))
+
+  # BH correction within each cohort separately
+  if (!is.null(spearman_rows) && nrow(spearman_rows) > 0) {
+    spearman_rows <- spearman_rows %>%
+      group_by(Cohort) %>%
+      mutate(p_adj_BH = p.adjust(p_value, method = "BH")) %>%
+      ungroup() %>%
+      mutate(
+        significance = case_when(
+          p_adj_BH < 0.001 ~ "***",
+          p_adj_BH < 0.01  ~ "**",
+          p_adj_BH < 0.05  ~ "*",
+          TRUE             ~ "ns"
+        ),
+        p_value  = formatC(p_value,  digits = 4, format = "g"),
+        p_adj_BH = formatC(p_adj_BH, digits = 4, format = "g")
+      )
+
+    cat("\n  ═══ Spearman Correlation: Pack-Years vs miRNA Expression ═══\n")
+    print(spearman_rows, row.names = FALSE)
+
+    write.csv(spearman_rows,
+              file.path(OUT_DIR, "Spearman_PackYears_miRNA.csv"),
+              row.names = FALSE)
+    cat("  ✓ Saved: Spearman_PackYears_miRNA.csv\n")
+  }
+
+  # ── 11C: Per-cohort scatter (LUAD and LUSC individually) ───────────────────
+  cat("\n  Building per-cohort scatter plots...\n")
+
+  for (coh in c("TCGA-LUAD", "TCGA-LUSC")) {
+    df_py <- corr_cohorts[[coh]]
+    if (nrow(df_py) < MIN_N_GROUP) {
+      cat("  [SKIP]", coh, "— n =", nrow(df_py), "\n"); next
+    }
+
+    py_long <- df_py %>%
+      pivot_longer(cols = all_of(log2_cols_present),
+                   names_to = "log2_col", values_to = "log2_expr") %>%
+      left_join(SIG %>% select(log2_col, mature_name, direction),
+                by = "log2_col") %>%
+      filter(!is.na(log2_expr), !is.na(pack_years)) %>%
+      mutate(mature_name = factor(mature_name, levels = SIG$mature_name))
+
+    # Annotation: rho + p per facet
+    annot_py <- spearman_rows %>%
+      filter(Cohort == coh) %>%
+      mutate(
+        label = paste0("rho=", rho, "\np.adj=", p_adj_BH, " ", significance)
+      )
+
+    p_py <- ggplot(py_long, aes(x = pack_years, y = log2_expr)) +
+      geom_point(alpha = 0.35, size = 1.3, color = COL_EVER) +
+      geom_smooth(method = "lm", se = TRUE, color = "grey25",
+                  linewidth = 0.7, fill = "grey85") +
+      geom_text(data = annot_py,
+                aes(x = Inf, y = Inf, label = label),
+                inherit.aes = FALSE,
+                hjust = 1.05, vjust = 1.3, size = 3,
+                color = "grey20", fontface = "italic") +
+      facet_wrap(~ mature_name, scales = "free_y", nrow = 1) +
+      labs(
+        title    = paste0(coh, " — miRNA Expression vs Pack-Years Smoked"),
+        subtitle = "Spearman ρ  |  Ever smokers only  |  log2(RPM + 1)  |  Tumor samples",
+        x        = "Pack-Years Smoked",
+        y        = "Expression  [log2(RPM + 1)]"
+      ) +
+      base_theme
+
+    coh_slug <- gsub("[^A-Za-z0-9]", "_", coh)
+    out_py   <- file.path(OUT_DIR, paste0("Scatter_PackYears_", coh_slug, ".png"))
+    png(out_py, width = 3000, height = 2000, res = 300)
+    print(p_py)
+    dev.off()
+    cat("  Saved:", out_py, "\n")
+  }
+
+  # ── 11D: POOLED scatter (LUAD + LUSC combined, colour by cohort) ───────────
+  cat("\n  Building Pooled scatter plot...\n")
+
+  df_pooled_py <- corr_cohorts[["LUAD+LUSC (Pooled)"]]
+
+  if (nrow(df_pooled_py) >= MIN_N_GROUP) {
+
+    COL_LUAD <- "#1B7837"   # green — LUAD
+    COL_LUSC <- "#762A83"   # purple — LUSC
+    COHORT_PAL <- c("TCGA-LUAD" = COL_LUAD, "TCGA-LUSC" = COL_LUSC)
+
+    pool_long <- df_pooled_py %>%
+      pivot_longer(cols = all_of(log2_cols_present),
+                   names_to = "log2_col", values_to = "log2_expr") %>%
+      left_join(SIG %>% select(log2_col, mature_name, direction),
+                by = "log2_col") %>%
+      filter(!is.na(log2_expr), !is.na(pack_years)) %>%
+      mutate(mature_name = factor(mature_name, levels = SIG$mature_name))
+
+    # Annotation from pooled spearman results
+    # annot_pool must have a "mature_name" column matching facet levels
+    # so each label appears in the correct panel only
+    annot_pool <- spearman_rows %>%
+      filter(Cohort == "LUAD+LUSC (Pooled)") %>%
+      mutate(
+        mature_name = factor(miRNA, levels = SIG$mature_name),
+        label       = paste0("rho = ", rho, "\np.adj = ", p_adj_BH, "  ", significance)
+      )
+
+    p_pool_py <- ggplot(pool_long,
+                        aes(x = pack_years, y = log2_expr, color = cohort)) +
+      # Overall regression line (all pooled, grey)
+      geom_smooth(aes(group = 1), method = "lm", se = TRUE,
+                  color = "grey30", fill = "grey88",
+                  linewidth = 0.8, linetype = "solid") +
+      # Per-cohort regression lines
+      geom_smooth(aes(group = cohort, color = cohort),
+                  method = "lm", se = FALSE,
+                  linewidth = 0.6, linetype = "dashed") +
+      # Points coloured by cohort
+      geom_point(alpha = 0.35, size = 1.3) +
+      # Spearman rho annotation — bottom-LEFT of each facet
+      # annot_pool has mature_name so ggplot routes each label to the right panel
+      geom_text(data = annot_pool,
+                aes(x = -Inf, y = -Inf, label = label,
+                    group = mature_name),
+                inherit.aes = FALSE,
+                hjust = -0.05, vjust = -0.35, size = 2.8,
+                color = "grey25", fontface = "italic",
+                lineheight = 1.2) +
+      scale_color_manual(
+        values = COHORT_PAL,
+        name   = "Cohort",
+        labels = c("TCGA-LUAD", "TCGA-LUSC")
+      ) +
+      facet_wrap(~ mature_name, scales = "free_y", nrow = 1) +
+      labs(
+        title    = "LUAD+LUSC Pooled — miRNA Expression vs Pack-Years Smoked",
+        subtitle = paste0(
+          "Spearman ρ (pooled, grey line)  |  Ever smokers only  |  log2(RPM + 1)\n",
+          "Solid = pooled trend  ·  Dashed = per-cohort trend  ·  Green = LUAD  ·  Purple = LUSC"
+        ),
+        x = "Pack-Years Smoked",
+        y = "Expression  [log2(RPM + 1)]"
+      ) +
+      base_theme +
+      theme(
+        legend.position   = c(0.91, 0.15),
+        legend.background = element_rect(fill  = alpha("white", 0.88),
+                                         color = "grey70",
+                                         linewidth = 0.3),
+        legend.key.size   = unit(0.45, "cm"),
+        legend.text       = element_text(size = 8),
+        legend.title      = element_text(size = 8, face = "bold")
+      )
+
+    out_pool_py <- file.path(OUT_DIR, "Scatter_PackYears_Pooled_LUAD_LUSC.png")
+    png(out_pool_py, width = 4200, height = 2000, res = 300)
+    print(p_pool_py)
+    dev.off()
+    cat("  Saved:", out_pool_py, "\n")
+
+  } else {
+    cat("  [SKIP] Pooled pack-years — n =", nrow(df_pooled_py), "\n")
+  }
+
+  # ── 11E: 3×3 panel — one panel per miRNA, rows = cohorts ──────────────────
+  cat("\n  Building 9-panel pack-years figure...\n")
+
+  panel_py_list <- list()
+  COHORT_PANEL_ORDER <- c("TCGA-LUAD", "TCGA-LUSC", "LUAD+LUSC (Pooled)")
+
+  for (mir in SIG$mature_name) {
+    lcol <- SIG$log2_col[SIG$mature_name == mir]
+
+    for (coh_name in COHORT_PANEL_ORDER) {
+
+      df_sub <- corr_cohorts[[coh_name]]
+      if (is.null(df_sub) || nrow(df_sub) < MIN_N_GROUP) {
+        panel_py_list[[paste(mir, coh_name)]] <- NULL; next
+      }
+
+      df_sub <- df_sub %>%
+        filter(!is.na(.data[[lcol]]), !is.na(pack_years))
+      if (nrow(df_sub) < MIN_N_GROUP) {
+        panel_py_list[[paste(mir, coh_name)]] <- NULL; next
+      }
+
+      # Spearman annotation for this panel
+      sp_row <- spearman_rows %>%
+        filter(Cohort == coh_name, miRNA == mir)
+      ann_lbl <- if (nrow(sp_row) > 0)
+        paste0("rho=", sp_row$rho[1], "  p.adj=",
+               sp_row$p_adj_BH[1], " ", sp_row$significance[1])
+      else ""
+
+      pt_col <- if (coh_name == "TCGA-LUAD") COL_LUAD else
+                if (coh_name == "TCGA-LUSC") COL_LUSC else COL_EVER
+
+      p_sub <- ggplot(df_sub, aes(x = pack_years, y = .data[[lcol]])) +
+        geom_point(alpha = 0.35, size = 1.0, color = pt_col) +
+        geom_smooth(method = "lm", se = TRUE, color = "grey25",
+                    linewidth = 0.6, fill = "grey88") +
+        annotate("text", x = Inf, y = Inf, label = ann_lbl,
+                 hjust = 1.05, vjust = 1.4, size = 2.5,
+                 color = "grey20", fontface = "italic") +
+        labs(
+          title    = coh_name,
+          subtitle = mir,
+          x        = "Pack-Years",
+          y        = "log2(RPM + 1)"
+        ) +
+        theme_bw(base_size = 9) +
+        theme(
+          plot.title       = element_text(face = "bold", size = 9),
+          plot.subtitle    = element_text(size = 7.5, color = "grey20",
+                                          face = "italic"),
+          legend.position  = "none",
+          panel.grid.minor = element_blank(),
+          axis.text        = element_text(size = 7.5)
+        )
+
+      panel_py_list[[paste(mir, coh_name)]] <- p_sub
+    }
+  }
+
+  panel_py_list <- Filter(Negate(is.null), panel_py_list)
+
+  if (length(panel_py_list) >= 2) {
+    mega_py <- wrap_plots(panel_py_list, ncol = 3) +
+      plot_annotation(
+        title    = "miRNA Expression vs Pack-Years Smoked — 3-miRNA Signature",
+        subtitle = paste0(
+          "Spearman ρ · BH-adjusted p-value · Ever smokers only · log2(RPM+1) · Tumor samples\n",
+          "Columns: TCGA-LUAD  |  TCGA-LUSC  |  LUAD+LUSC Pooled",
+          "     Rows: hsa-miR-509-3p  |  hsa-miR-377-3p  |  hsa-miR-378h"
+        ),
+        theme = theme(
+          plot.title    = element_text(face = "bold", size = 14),
+          plot.subtitle = element_text(color = "grey35", size = 9)
+        )
+      )
+
+    out_mega_py <- file.path(OUT_DIR,
+                              "Panel_PackYears_3miRNA_9plots_AllCohorts.png")
+    png(out_mega_py, width = 5400, height = 5400, res = 300)
+    print(mega_py)
+    dev.off()
+    cat("  Saved:", out_mega_py, "\n")
+  }
+
+} # end if py_available
+
+# ==============================================================================
+# PART 12 — Survival analysis: Ever vs Never smoker KM plots
+# ==============================================================================
+
+cat("\n── Part 12: Survival analysis by smoking status ──\n")
+
+rs_available <- !is.null(CSV_LUAD_RS) && file.exists(CSV_LUAD_RS) &&
+                !is.null(CSV_LUSC_RS) && file.exists(CSV_LUSC_RS)
+
+if (rs_available) {
+
+  luad_rs <- read.csv(CSV_LUAD_RS, stringsAsFactors = FALSE)
+  lusc_rs <- read.csv(CSV_LUSC_RS, stringsAsFactors = FALSE)
+
+  merge_survival <- function(rs_df, clin_df, cohort_label) {
+    clin_sub <- clin_df %>%
+      select(case_id, smoking_group, any_of("pack_years"))
+    rs_df %>%
+      left_join(clin_sub, by = "case_id") %>%
+      filter(!is.na(os_months), !is.na(os_status),
+             smoking_group %in% c("Never","Ever")) %>%
+      mutate(
+        smoking_group = factor(smoking_group, levels = c("Never","Ever")),
+        cohort        = cohort_label
+      )
+  }
+
+  luad_surv <- if (!is.null(luad_clin))
+    merge_survival(luad_rs, luad_clin, "TCGA-LUAD") else NULL
+  lusc_surv <- if (!is.null(lusc_clin))
+    merge_survival(lusc_rs, lusc_clin, "TCGA-LUSC") else NULL
+
+  surv_datasets <- Filter(Negate(is.null), list(
+    "TCGA-LUAD"          = luad_surv,
+    "TCGA-LUSC"          = lusc_surv,
+    "LUAD+LUSC (Pooled)" = bind_rows(luad_surv, lusc_surv)
+  ))
+
+  for (dname in names(surv_datasets)) {
+    df_s <- surv_datasets[[dname]]
+    if (is.null(df_s) || nrow(df_s) < MIN_N_GROUP) next
+
+    tbl_s <- table(df_s$smoking_group)
+    if (any(tbl_s < MIN_N_GROUP)) {
+      cat("  [SKIP KM]", dname, "— insufficient n in a smoking group\n"); next
+    }
+
+    km_fit <- survfit(Surv(os_months, os_status) ~ smoking_group, data = df_s)
+    lr_p   <- 1 - pchisq(
+      survdiff(Surv(os_months, os_status) ~ smoking_group, data = df_s)$chisq,
+      df = 1)
+
+    x_max <- min(ceiling(quantile(df_s$os_months, 0.95) / 12) * 12, 120)
+    brk   <- ifelse(x_max >= 120, 36, ifelse(x_max > 60, 24, 12))
+
+    n_labs <- df_s %>%
+      group_by(smoking_group) %>%
+      summarise(n = n(), ev = sum(os_status), .groups = "drop")
+    leg_labs <- paste0(n_labs$smoking_group,
+                       " (n=", n_labs$n, ", ev=", n_labs$ev, ")")
+
+    km_plot <- ggsurvplot(
+      km_fit, data = df_s,
+      palette           = c(COL_NEVER, COL_EVER),
+      size              = 0.9,
+      pval              = FALSE,
+      conf.int          = FALSE,
+      risk.table        = TRUE,
+      risk.table.height = 0.25,
+      risk.table.fontsize = 3,
+      risk.table.y.text = FALSE,
+      tables.theme      = theme_cleantable(),
+      censor.shape      = "|", censor.size = 3,
+      surv.median.line  = "hv",
+      legend.labs       = leg_labs,
+      legend.title      = "",
+      xlab  = "Time (months)",
+      ylab  = "Overall Survival Probability",
+      xlim  = c(0, x_max),
+      break.time.by = brk,
+      ylim  = c(0, 1.02),
+      title = paste0(dname, " — OS by Smoking Status"),
+      ggtheme = theme_bw(base_size = 10) +
+        theme(
+          plot.title      = element_text(face = "bold", size = 11),
+          plot.subtitle   = element_text(size = 8, color = "grey30"),
+          legend.position = c(0.72, 0.82),
+          legend.background = element_rect(fill = "white", color = "grey80",
+                                           linewidth = 0.3),
+          legend.text     = element_text(size = 8),
+          panel.grid.minor = element_blank()
+        )
+    )
+    km_plot$plot <- km_plot$plot +
+      labs(subtitle = paste0(
+        "Log-rank p = ", formatC(lr_p, digits = 3, format = "g"),
+        "   |   Blue = Never  ·  Red = Ever"
+      ))
+
+    slug    <- gsub("[^A-Za-z0-9]", "_", dname)
+    out_km  <- file.path(OUT_DIR, paste0("KM_Smoking_NeverVsEver_", slug, ".png"))
+    png(out_km, width = 2400, height = 2400, res = 300)
+    print(km_plot)
+    dev.off()
+    cat("  Saved:", out_km, "\n")
+  }
+
+} else {
+  cat("  Risk score CSVs not found — skipping survival analysis.\n")
+  cat("  Set CSV_LUAD_RS / CSV_LUSC_RS to valid paths to enable this section.\n")
+}
+
+# ==============================================================================
+# PART 13 — Final summary CSV
+# ==============================================================================
+
+cat("\n── Part 13: Write final summary ──\n")
+
+# Merge descriptive + Wilcoxon into one master table
+master_tbl <- desc_smk %>%
+  pivot_wider(
+    id_cols     = c(cohort, mature_name),
+    names_from  = smoking_group,
+    values_from = c(n, median, mean, sd, zero_pct),
+    names_sep   = "_"
+  ) %>%
+  left_join(wilcox_smk %>%
+              select(cohort, mature_name, W, p_value, p_adj_BH,
+                     significance, fold_change_ever_vs_never),
+            by = c("cohort","mature_name"))
+
+cat("\n═══ Master Summary Table ═══\n")
+print(master_tbl, n = 30)
+
+write.csv(master_tbl,
+          file.path(OUT_DIR, "Master_Summary_Smoking_miRNA.csv"),
+          row.names = FALSE)
+cat("✓ Saved: Master_Summary_Smoking_miRNA.csv\n")
+
+# ==============================================================================
+# PART 14 — Final output list
+# ==============================================================================
+
+cat("\n\n✓ ════════════ ALL DONE ════════════\n")
+cat("Output directory:", OUT_DIR, "\n\n")
+cat("  Plots:\n")
+cat("  Violin_Smoking_NeverVsEver_TCGA_LUAD.png          — violin+box, LUAD\n")
+cat("  Violin_Smoking_NeverVsEver_TCGA_LUSC.png          — violin+box, LUSC\n")
+cat("  Violin_Smoking_NeverVsEver_LUAD_LUSC__Pooled_.png — violin+box, Pooled\n")
+cat("  Panel_Smoking_3miRNA_9plots_AllCohorts.png         — 9-panel mega figure\n")
+cat("  Scatter_PackYears_TCGA_LUAD.png                    — pack-years scatter, LUAD\n")
+cat("  Scatter_PackYears_TCGA_LUSC.png                    — pack-years scatter, LUSC\n")
+cat("  Scatter_PackYears_Pooled_LUAD_LUSC.png             — pooled scatter (colour by cohort)\n")
+cat("  Panel_PackYears_3miRNA_9plots_AllCohorts.png       — 9-panel: 3 miRNAs × 3 cohorts\n")
+cat("  KM_Smoking_NeverVsEver_*.png                       — survival by smoking status\n\n")
+cat("  CSVs:\n")
+cat("  Smoking_Demographics_Summary.csv  — n & % by smoking group\n")
+cat("  Descriptive_Stats_Smoking.csv     — mean/median/SD per group\n")
+cat("  Wilcoxon_Smoking_EverVsNever.csv  — W, p, p.adj (BH), significance\n")
+cat("  Master_Summary_Smoking_miRNA.csv  — combined stats table\n")
+cat("  Spearman_PackYears_miRNA.csv      — Spearman rho, p, p.adj (BH) all cohorts\n")
+```

@@ -1,0 +1,1580 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+# ==============================================================================
+# TCGA VALIDATION — 2-miRNA Non-Targeted NSCLC
+# Refined & unified pipeline
+#
+# Signature (2-miRNA — hsa-miR-378h dropped: 99% zero RPM in TCGA RNA-seq):
+#   hsa-miR-509-3p  β = +0.743073677989302  (Risk)
+#   hsa-miR-377-3p  β = +0.502724385364305  (Risk)
+#
+# Pipeline:
+#   PART 0  — Prerequisites: verify log2 columns exist in CSVs
+#   PART 1  — Define signature
+#   PART 2  — Load MAF + cBioPortal fusion → build targeted case lists
+#   PART 3  — Filter non-targeted, fix types
+#   PART 4  — Z-score WITHIN non-targeted subset → recompute 2-miRNA score
+#   PART 5  — Validation function
+#   PART 6  — Validate full non-targeted cohorts
+#   PART 7  — Stage annotation + subsets
+#   PART 8  — Summary table + export
+# ==============================================================================
+
+library(TCGAbiolinks)
+library(maftools)
+library(survival)
+library(survminer)
+library(timeROC)
+library(ggplot2)
+library(dplyr)
+
+# ==============================================================================
+# PART 0 — Prerequisite: verify log2 columns exist in risk score CSVs
+#
+# If log2 columns are missing, run the injection block below (set RUN = TRUE).
+# If CSVs already have log2_hsa_miR_509_3p and log2_hsa_miR_377_3p → skip.
+# ==============================================================================
+
+RUN_LOG2_INJECTION <- !all(c("log2_hsa_miR_509_3p", "log2_hsa_miR_377_3p") %in%
+                          colnames(read.csv("TCGA_LUAD_risk_scores_3mir.csv", nrows = 2)))  # TRUE if log2 columns are missing
+
+if (RUN_LOG2_INJECTION) {
+
+  luad_mirna_df <- readRDS("TCGA_LUAD_miRNA_df.rds")
+  lusc_mirna_df <- readRDS("TCGA_LUSC_miRNA_df.rds")
+  cat("✓ miRNA RDS files loaded\n")
+
+  # Only inject 509-3p and 377-3p (378h excluded — platform dropout)
+  sig_mirnas_inject <- c("hsa-miR-509-3p", "hsa-miR-377-3p")
+
+  mature_to_precursor <- list(
+    "hsa-miR-509-3p" = c("hsa-mir-509-1", "hsa-mir-509-2", "hsa-mir-509-3"),
+    "hsa-miR-377-3p" = c("hsa-mir-377")
+  )
+
+  log2_cols_inject <- paste0("log2_", gsub("-", "_", sig_mirnas_inject))
+
+  extract_log2_2mir <- function(mirna_df, cohort_name) {
+    cat("\n[EXTRACT]", cohort_name, "\n")
+    rpm_cols           <- grep("^reads_per_million_miRNA_mapped_TCGA-",
+                                colnames(mirna_df), value = TRUE)
+    expr_rpm           <- as.matrix(mirna_df[, rpm_cols])
+    mode(expr_rpm)     <- "numeric"
+    rownames(expr_rpm) <- mirna_df$miRNA_ID
+    colnames(expr_rpm) <- sub("^reads_per_million_miRNA_mapped_", "",
+                               colnames(expr_rpm))
+
+    expr_sig <- do.call(rbind, lapply(names(mature_to_precursor), function(mature) {
+      pf  <- mature_to_precursor[[mature]]
+      pf  <- pf[pf %in% rownames(expr_rpm)]
+      if (length(pf) == 0) stop("Precursor not found for: ", mature)
+      row <- if (length(pf) == 1) expr_rpm[pf, , drop = FALSE]
+             else matrix(colSums(expr_rpm[pf, , drop = FALSE]), nrow = 1)
+      rownames(row) <- mature
+      row
+    }))
+
+    stype    <- substr(colnames(expr_sig), 14, 15)
+    expr_sig <- expr_sig[, stype == "01", drop = FALSE]
+    case_ids <- substr(colnames(expr_sig), 1, 12)
+    dups     <- duplicated(case_ids)
+    expr_sig <- expr_sig[, !dups, drop = FALSE]
+    case_ids <- toupper(case_ids[!dups])
+    cat("  Samples after primary filter:", length(case_ids), "\n")
+
+    mode(expr_sig) <- "numeric"
+    log2_mat       <- log2(expr_sig + 1)
+
+    log2_df           <- as.data.frame(t(log2_mat[sig_mirnas_inject, , drop = FALSE]))
+    colnames(log2_df) <- log2_cols_inject
+    log2_df$case_id   <- case_ids
+    log2_df
+  }
+
+  luad_log2 <- extract_log2_2mir(luad_mirna_df, "TCGA-LUAD")
+  lusc_log2 <- extract_log2_2mir(lusc_mirna_df, "TCGA-LUSC")
+
+  for (cohort in c("LUAD", "LUSC")) {
+    csv_path <- paste0("TCGA_", cohort, "_risk_scores_3mir.csv")
+    log2_tbl <- if (cohort == "LUAD") luad_log2 else lusc_log2
+    rs_df    <- read.csv(csv_path, stringsAsFactors = FALSE)
+    rs_df    <- rs_df[, !colnames(rs_df) %in% log2_cols_inject]
+    merged   <- rs_df %>% left_join(log2_tbl, by = "case_id")
+    write.csv(merged, csv_path, row.names = FALSE)
+    cat(sprintf("✓ %s updated — %d cols\n", csv_path, ncol(merged)))
+  }
+}
+
+# Verify log2 columns present before proceeding
+luad_check <- read.csv("TCGA_LUAD_risk_scores_3mir.csv",
+                        nrows = 2, stringsAsFactors = FALSE)
+required_log2 <- c("log2_hsa_miR_509_3p", "log2_hsa_miR_377_3p")
+missing <- required_log2[!required_log2 %in% colnames(luad_check)]
+if (length(missing) > 0) {
+  stop("Missing log2 columns: ", paste(missing, collapse = ", "),
+       "\nSet RUN_LOG2_INJECTION <- TRUE and re-run PART 0.")
+}
+cat("✓ PART 0 — log2 columns verified.\n")
+
+# ==============================================================================
+# PART 1 — Define 2-miRNA signature
+# ==============================================================================
+
+beta_2mir <- c(
+  "log2_hsa_miR_509_3p" =  0.743073677989302,
+  "log2_hsa_miR_377_3p" =  0.502724385364305
+)
+log2_cols_2mir <- names(beta_2mir)
+
+cat("\n=== 2-miRNA Signature ===\n")
+print(data.frame(
+  miRNA  = c("hsa-miR-509-3p", "hsa-miR-377-3p"),
+  beta   = as.numeric(beta_2mir),
+  HR     = c(2.102, 1.653),
+  p      = c(0.00968, 0.0333),
+  note   = c("Risk factor", "Risk factor")
+))
+cat("Note: hsa-miR-378h excluded — 99% zero RPM in TCGA RNA-seq (platform dropout)\n")
+
+# ==============================================================================
+# PART 2 — Load MAF + cBioPortal fusions → build targeted case lists
+# ==============================================================================
+
+# ── 2a. Load MAF (download once, then reload from saved objects) ──────────────
+RUN_MAF_DOWNLOAD <- !all(file.exists(c("TCGA_LUAD_MAF.rds", "TCGA_LUSC_MAF.rds")))  # download on first run
+
+if (RUN_MAF_DOWNLOAD) {
+
+  get_maf <- function(project) {
+    query <- GDCquery(project       = project,
+                      data.category = "Simple Nucleotide Variation",
+                      data.type     = "Masked Somatic Mutation",
+                      access        = "open")
+    GDCdownload(query, method = "api", files.per.chunk = 10)
+    GDCprepare(query)
+  }
+
+  luad_maf_raw <- get_maf("TCGA-LUAD")
+  lusc_maf_raw <- get_maf("TCGA-LUSC")
+  saveRDS(luad_maf_raw, "TCGA_LUAD_MAF.rds")
+  saveRDS(lusc_maf_raw, "TCGA_LUSC_MAF.rds")
+  cat("✓ MAF files saved.\n")
+
+} else {
+  luad_maf_raw <- readRDS("TCGA_LUAD_MAF.rds")
+  lusc_maf_raw <- readRDS("TCGA_LUSC_MAF.rds")
+  cat("✓ MAF files loaded from RDS.\n")
+}
+
+luad_maf <- luad_maf_raw %>%
+  mutate(case_id = substr(Tumor_Sample_Barcode, 1, 12))
+lusc_maf <- lusc_maf_raw %>%
+  mutate(case_id = substr(Tumor_Sample_Barcode, 1, 12))
+
+cat("LUAD MAF — unique cases:", n_distinct(luad_maf$case_id), "\n")
+cat("LUSC MAF — unique cases:", n_distinct(lusc_maf$case_id), "\n")
+
+# ── 2b. Load cBioPortal fusion files ─────────────────────────────────────────
+# Download from:
+#   https://www.cbioportal.org/study/summary?id=luad_tcga_pan_can_atlas_2018
+#   https://www.cbioportal.org/study/summary?id=lusc_tcga_pan_can_atlas_2018
+# Unzip → data_sv.txt
+
+luad_sv <- read.delim("luad_tcga_pan_can_atlas_2018/data_sv.txt",
+                       stringsAsFactors = FALSE)
+lusc_sv <- read.delim("lusc_tcga_pan_can_atlas_2018/data_sv.txt",
+                       stringsAsFactors = FALSE)
+
+# ── 2c. MAF-based targeted cases ─────────────────────────────────────────────
+# Exclusion rationale:
+#   EGFR    — all mutations (erlotinib/gefitinib/osimertinib)
+#   KRAS    — G12C only (sotorasib/adagrasib)
+#   BRAF    — V600E only (dabrafenib+trametinib)
+#   MET     — exon 14 skipping only (capmatinib/tepotinib)
+#   ERBB2   — exon 20 ins/dup only (T-DXd; other mutations are passengers)
+#   NTRK1/2/3 — all (larotrectinib/entrectinib)
+#   ALK/ROS1/RET — fusion-based (handled via fusion file below)
+
+get_maf_targeted <- function(maf_df) {
+  maf_df %>%
+    filter(
+      (Hugo_Symbol == "EGFR") |
+      (Hugo_Symbol == "KRAS"  & HGVSp_Short == "p.G12C") |
+      (Hugo_Symbol == "BRAF"  & HGVSp_Short == "p.V600E") |
+      (Hugo_Symbol == "MET"   & grepl("splice|Splice|exon.?14|\\b14\\b",
+                                       HGVSp_Short, ignore.case = TRUE)) |
+      (Hugo_Symbol == "ERBB2" & grepl("ins|dup",
+                                       HGVSp_Short, ignore.case = TRUE)) |
+      (Hugo_Symbol %in% c("NTRK1", "NTRK2", "NTRK3"))
+    ) %>%
+    pull(case_id) %>%
+    unique()
+}
+
+luad_maf_targeted <- get_maf_targeted(luad_maf)
+lusc_maf_targeted <- get_maf_targeted(lusc_maf)
+
+# Per-gene breakdown
+for (cohort in c("LUAD", "LUSC")) {
+  maf_df <- if (cohort == "LUAD") luad_maf else lusc_maf
+  cat(sprintf("\n--- %s MAF targeted breakdown ---\n", cohort))
+  maf_df %>%
+    filter(
+      (Hugo_Symbol == "EGFR") |
+      (Hugo_Symbol == "KRAS"  & HGVSp_Short == "p.G12C") |
+      (Hugo_Symbol == "BRAF"  & HGVSp_Short == "p.V600E") |
+      (Hugo_Symbol == "MET"   & grepl("splice|Splice|exon.?14|\\b14\\b",
+                                       HGVSp_Short, ignore.case = TRUE)) |
+      (Hugo_Symbol == "ERBB2" & grepl("ins|dup",
+                                       HGVSp_Short, ignore.case = TRUE)) |
+      (Hugo_Symbol %in% c("NTRK1", "NTRK2", "NTRK3"))
+    ) %>%
+    group_by(Hugo_Symbol) %>%
+    summarise(n_cases  = n_distinct(case_id),
+              variants = paste(unique(HGVSp_Short)[1:min(3,
+                                 n_distinct(HGVSp_Short))],
+                               collapse = ", "),
+              .groups = "drop") %>%
+    arrange(desc(n_cases)) %>%
+    print()
+}
+
+# ── 2d. Fusion-based targeted cases (ALK / ROS1 / RET) ───────────────────────
+fusion_genes <- c("ALK", "ROS1", "RET")
+
+get_fusion_targeted <- function(sv_df) {
+  sv_df %>%
+    filter(Site1_Hugo_Symbol %in% fusion_genes |
+           Site2_Hugo_Symbol %in% fusion_genes) %>%
+    mutate(case_id = substr(Sample_Id, 1, 12)) %>%
+    pull(case_id) %>%
+    unique()
+}
+
+luad_fusion_targeted <- get_fusion_targeted(luad_sv)
+lusc_fusion_targeted <- get_fusion_targeted(lusc_sv)
+
+# Fusion breakdown
+for (cohort in c("LUAD", "LUSC")) {
+  sv_df <- if (cohort == "LUAD") luad_sv else lusc_sv
+  cat(sprintf("\n--- %s fusion targeted breakdown ---\n", cohort))
+  sv_df %>%
+    filter(Site1_Hugo_Symbol %in% fusion_genes |
+           Site2_Hugo_Symbol %in% fusion_genes) %>%
+    mutate(case_id = substr(Sample_Id, 1, 12),
+           driver  = ifelse(Site1_Hugo_Symbol %in% fusion_genes,
+                            Site1_Hugo_Symbol, Site2_Hugo_Symbol)) %>%
+    group_by(driver) %>%
+    summarise(n_cases = n_distinct(case_id),
+              example = paste(unique(Event_Info)[1:min(3,
+                                n_distinct(Event_Info))],
+                              collapse = " | "),
+              .groups = "drop") %>%
+    print()
+}
+
+# ── 2e. Union ─────────────────────────────────────────────────────────────────
+luad_all_targeted <- union(luad_maf_targeted, luad_fusion_targeted)
+lusc_all_targeted <- union(lusc_maf_targeted, lusc_fusion_targeted)
+
+cat("\n═══ EXCLUSION SUMMARY ═══\n")
+cat("LUAD — MAF:", length(luad_maf_targeted),
+    "| Fusion:", length(luad_fusion_targeted),
+    "| Total excluded:", length(luad_all_targeted), "\n")
+cat("LUSC — MAF:", length(lusc_maf_targeted),
+    "| Fusion:", length(lusc_fusion_targeted),
+    "| Total excluded:", length(lusc_all_targeted), "\n")
+
+# ==============================================================================
+# PART 3 — Load risk score CSVs, filter non-targeted, fix types
+# ==============================================================================
+
+luad_df <- read.csv("TCGA_LUAD_risk_scores_3mir.csv", stringsAsFactors = FALSE)
+lusc_df <- read.csv("TCGA_LUSC_risk_scores_3mir.csv", stringsAsFactors = FALSE)
+
+# Overlap check
+cat("\nLUAD — targeted cases found in CSV:",
+    sum(luad_df$case_id %in% luad_all_targeted), "/", nrow(luad_df), "\n")
+cat("LUSC — targeted cases found in CSV:",
+    sum(lusc_df$case_id %in% lusc_all_targeted), "/", nrow(lusc_df), "\n")
+
+# Filter
+luad_nt_raw <- luad_df %>% filter(!case_id %in% luad_all_targeted)
+lusc_nt_raw <- lusc_df %>% filter(!case_id %in% lusc_all_targeted)
+
+# Fix column types (actual column names: os_months, os_status, RiskScore)
+fix_types <- function(df) {
+  df %>% mutate(
+    os_months  = as.numeric(os_months),
+    os_status  = as.integer(os_status),
+    across(all_of(log2_cols_2mir), as.numeric)
+  )
+}
+
+luad_nt_raw <- fix_types(luad_nt_raw)
+lusc_nt_raw <- fix_types(lusc_nt_raw)
+
+cat("\n═══ NON-TARGETED COHORT SIZES ═══\n")
+cat("LUAD — original:", nrow(luad_df),
+    "| excluded:", length(luad_all_targeted),
+    "| remaining:", nrow(luad_nt_raw),
+    "| events:", sum(luad_nt_raw$os_status), "\n")
+cat("LUSC — original:", nrow(lusc_df),
+    "| excluded:", length(lusc_all_targeted),
+    "| remaining:", nrow(lusc_nt_raw),
+    "| events:", sum(lusc_nt_raw$os_status), "\n")
+
+write.csv(
+  data.frame(case_id = luad_nt_raw$case_id),
+  "luad_nontargeted_cases.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  data.frame(case_id = lusc_nt_raw$case_id),
+  "lusc_nontargeted_cases.csv",
+  row.names = FALSE
+)
+
+cat("✓ Non-targeted case ID lists exported:\n")
+cat("  luad_nontargeted_cases.csv —", nrow(luad_nt_raw), "cases\n")
+cat("  lusc_nontargeted_cases.csv —", nrow(lusc_nt_raw), "cases\n")
+# ==============================================================================
+# PART 4 — Z-score WITHIN non-targeted subset → recompute 2-miRNA risk score
+#
+# Critical: must NOT use z-scores from the full cohort CSV —
+# those were computed before targeted cases were removed.
+# ==============================================================================
+
+compute_2mir_score <- function(df, cohort_label) {
+
+  cat("\n── Recomputing 2-miRNA score:", cohort_label, "──\n")
+
+  # Check log2 distributions before z-scoring
+  for (col in log2_cols_2mir) {
+    cat(sprintf("  %s — zero: %.1f%% | mean: %.3f | sd: %.3f\n",
+                col,
+                100 * mean(df[[col]] == 0, na.rm = TRUE),
+                mean(df[[col]], na.rm = TRUE),
+                sd(df[[col]], na.rm = TRUE)))
+  }
+
+  # Z-score within this subset
+  z_mat <- scale(df[, log2_cols_2mir])
+  cat("  Z-score means:", paste(round(colMeans(z_mat), 4), collapse=", "), "\n")
+  cat("  Z-score SDs:  ", paste(round(apply(z_mat, 2, sd), 4), collapse=", "), "\n")
+
+  # Risk score = β1×z(509-3p) + β2×z(377-3p)
+  risk_score    <- as.vector(z_mat %*% beta_2mir[log2_cols_2mir])
+  df$RiskScore  <- risk_score
+  df$RiskGroup  <- factor(
+    ifelse(risk_score >= median(risk_score), "High", "Low"),
+    levels = c("Low", "High")
+  )
+
+  cat("  Score range:", round(range(risk_score), 4), "\n")
+  cat("  Median cutoff:", round(median(risk_score), 4), "\n")
+  cat("  Low:", sum(df$RiskGroup=="Low"),
+      "| High:", sum(df$RiskGroup=="High"), "\n")
+  cat("  Events — Low:", sum(df$os_status[df$RiskGroup=="Low"]),
+      "| High:", sum(df$os_status[df$RiskGroup=="High"]), "\n")
+  df
+}
+
+luad_nt <- compute_2mir_score(luad_nt_raw, "TCGA-LUAD (Non-Targeted)")
+lusc_nt <- compute_2mir_score(lusc_nt_raw, "TCGA-LUSC (Non-Targeted)")
+
+# Save processed files
+write.csv(luad_nt, "TCGA_LUAD_NT_2mir_risk_scores.csv", row.names = FALSE)
+write.csv(lusc_nt, "TCGA_LUSC_NT_2mir_risk_scores.csv", row.names = FALSE)
+cat("\n✓ Non-targeted 2-miRNA risk score CSVs written.\n")
+
+# ==============================================================================
+# PART 5 — Validation function
+# ==============================================================================
+
+MIN_N      <- 20
+MIN_EVENTS <- 5
+
+# ==============================================================================
+# PART 5 FIX — surv_obj scoping for ggsurvplot
+# Replace the two lines inside validate_2mir_nt() and re-run
+# ==============================================================================
+
+validate_2mir_nt <- function(df, cohort_name,
+                              col_hi    = "#B22222",
+                              col_lo    = "#1874CD",
+                              roc_times = c(12, 24, 36, 60)) {
+
+  n_total  <- nrow(df)
+  n_events <- sum(df$os_status)
+
+  if (n_total < MIN_N || n_events < MIN_EVENTS) {
+    cat(sprintf("⚠  %s skipped: n=%d, events=%d\n",
+                cohort_name, n_total, n_events))
+    return(list(cohort=cohort_name, n=n_total, events=n_events,
+                HR=NA, HR_lo=NA, HR_hi=NA, cox_p=NA,
+                lr_p=NA, cindex=NA, auc_df=NULL, skipped=TRUE))
+  }
+
+  cat("\n══════════════════════════════════════════\n")
+  cat("Validating:", cohort_name, "\n")
+  cat(sprintf("n = %d | events = %d (%.1f%%)\n",
+              n_total, n_events, 100*mean(df$os_status)))
+  print(table(df$RiskGroup))
+
+  # ── KEY FIX: <<- assigns to parent env so ggsurvplot can find surv_obj ──
+  surv_obj <<- Surv(df$os_months, df$os_status)
+
+  # ── Cox (continuous) ──────────────────────────────────────────────────
+  cox_fit <- coxph(surv_obj ~ RiskScore, data=df, ties="efron")
+  s       <- summary(cox_fit)
+  hr      <- s$conf.int[1, "exp(coef)"]
+  hr_lo   <- s$conf.int[1, "lower .95"]
+  hr_hi   <- s$conf.int[1, "upper .95"]
+  cox_p   <- s$coefficients[1, "Pr(>|z|)"]
+  cindex  <- as.numeric(s$concordance["C"])
+
+  cat(sprintf("Cox — HR: %.3f (%.3f–%.3f) | p = %.4f | C-index: %.3f\n",
+              hr, hr_lo, hr_hi, cox_p, cindex))
+
+  # ── Log-rank ──────────────────────────────────────────────────────────
+  km_fit <- survfit(surv_obj ~ RiskGroup, data=df)
+  lr     <- survdiff(surv_obj ~ RiskGroup, data=df)
+  lr_p   <- pchisq(lr$chisq, df=1, lower.tail=FALSE)
+  cat(sprintf("Log-rank p = %.4f\n", lr_p))
+
+  # ── Time-dependent ROC ────────────────────────────────────────────────
+  valid_times <- roc_times[sapply(roc_times, function(t)
+    sum(df$os_months >= t) >= 20)]
+
+  auc_df <- NULL
+  if (length(valid_times) > 0) {
+    tryCatch({
+      troc     <- timeROC(T=df$os_months, delta=df$os_status,
+                          marker=df$RiskScore, cause=1,
+                          times=valid_times, iid=TRUE)
+      auc_vals <- as.numeric(troc$AUC)
+      ci_mat   <- confint(troc, level=0.95)$CI_AUC
+
+      auc_df <- data.frame(
+        Cohort    = cohort_name,
+        Timepoint = valid_times,
+        AUC       = round(auc_vals,    4),
+        AUC_lower = round(ci_mat[,1],  4),
+        AUC_upper = round(ci_mat[,2],  4)
+      )
+      cat("Time-ROC AUC (95% CI):\n")
+      print(auc_df[, -1])
+
+      n_t      <- length(valid_times)
+      roc_cols <- c("#B22222","#E88B00","#1874CD","#2ECC71")[seq_len(n_t)]
+      roc_df   <- do.call(rbind, lapply(seq_len(n_t), function(i) {
+        data.frame(
+          FPR  = troc$FP[, i],
+          TPR  = troc$TP[, i],
+          Time = sprintf("%d mo  AUC=%.3f (%.3f–%.3f)",
+                         valid_times[i], auc_vals[i],
+                         ci_mat[i,1], ci_mat[i,2])
+        )
+      }))
+
+      p_roc <- ggplot(roc_df, aes(x=FPR, y=TPR, color=Time)) +
+        geom_abline(slope=1, intercept=0, linetype="dashed",
+                    color="grey60", linewidth=0.5) +
+        geom_line(linewidth=0.9) +
+        scale_color_manual(values=setNames(roc_cols, unique(roc_df$Time)),
+                           name=NULL) +
+        scale_x_continuous("1 - Specificity", limits=c(0,1), expand=c(0.01,0)) +
+        scale_y_continuous("Sensitivity",     limits=c(0,1), expand=c(0.01,0)) +
+        labs(title    = paste0(cohort_name, " — Time-dependent ROC"),
+             subtitle = "2-miRNA z-score (non-targeted) | IPCW | 95% CI") +
+        theme_bw(base_size=10) +
+        theme(legend.position   = c(0.58, 0.16),
+              legend.background = element_rect(fill="white", color="grey80"),
+              legend.text       = element_text(size=8),
+              plot.title        = element_text(face="bold", size=11),
+              aspect.ratio      = 1)
+
+      out_roc <- paste0("TimeROC_2mir_NT_",
+                        gsub("[^A-Za-z0-9]","_", cohort_name), ".png")
+      ggsave(out_roc, p_roc, width=6.5, height=6.5, dpi=300)
+      cat("Time-ROC saved →", out_roc, "\n")
+
+    }, error = function(e) cat("timeROC failed:", conditionMessage(e), "\n"))
+  } else {
+    cat("No valid ROC timepoints\n")
+  }
+
+  # ── KM plot ───────────────────────────────────────────────────────────
+  x_max <- min(ceiling(quantile(df$os_months, 0.95)/12)*12, 120)
+  brk   <- ifelse(x_max >= 120, 36, ifelse(x_max > 60, 24, 12))
+
+  km_subtitle <- sprintf(
+    "HR = %.2f (95%% CI: %.2f–%.2f) | Cox p = %s | Log-rank p = %s | C-index = %.3f",
+    hr, hr_lo, hr_hi,
+    formatC(cox_p, digits=3, format="g"),
+    formatC(lr_p,  digits=3, format="g"),
+    cindex
+  )
+
+  km_plot <- ggsurvplot(
+    km_fit, data=df,
+    palette             = c(col_lo, col_hi),
+    size                = 0.85,
+    pval                = FALSE,
+    conf.int            = TRUE,
+    conf.int.alpha      = 0.10,
+    risk.table          = TRUE,
+    risk.table.height   = 0.28,
+    risk.table.fontsize = 3,
+    risk.table.y.text   = FALSE,
+    tables.theme        = theme_cleantable(),
+    censor.shape        = "|", censor.size=3,
+    surv.median.line    = "hv",
+    legend.labs  = c(paste0("Low risk  (n=", sum(df$RiskGroup=="Low"),  ")"),
+                     paste0("High risk (n=", sum(df$RiskGroup=="High"), ")")),
+    legend.title = "",
+    xlab         = "Time (months)",
+    ylab         = "Overall Survival Probability",
+    xlim         = c(0, x_max),
+    break.time.by = brk,
+    ylim         = c(0, 1.02),
+    title        = paste0(cohort_name,
+                          " — 2-miRNA signature (z-score, non-targeted)"),
+    ggtheme      = theme_bw(base_size=10) +
+      theme(plot.title        = element_text(face="bold", size=11),
+            plot.subtitle     = element_text(size=8, color="grey30",
+                                              margin=margin(b=4)),
+            legend.position   = c(0.78, 0.84),
+            legend.background = element_rect(fill="white", color="grey80",
+                                              linewidth=0.3))
+  )
+  km_plot$plot <- km_plot$plot + labs(subtitle = km_subtitle)
+
+  out_km <- paste0("KM_2mir_NT_",
+                   gsub("[^A-Za-z0-9]","_", cohort_name), ".png")
+  png(out_km, width=2200, height=2000, res=300)
+  print(km_plot)
+  dev.off()
+  cat("KM saved →", out_km, "\n")
+
+  # ── Risk distribution plot ────────────────────────────────────────────
+  rs_ord <- df %>% arrange(RiskScore) %>% mutate(idx=row_number())
+
+  p_dist <- ggplot(rs_ord,
+                   aes(x=idx, y=RiskScore,
+                       color=RiskGroup, shape=factor(os_status))) +
+    geom_hline(yintercept=median(df$RiskScore), linetype="dashed",
+               color="grey40", linewidth=0.6) +
+    geom_point(size=1.2, alpha=0.75) +
+    scale_color_manual(values=c("Low"=col_lo, "High"=col_hi),
+                       name="Risk group") +
+    scale_shape_manual(values=c("0"=1, "1"=16),
+                       labels=c("Alive/censored","Dead"),
+                       name="Status") +
+    labs(title    = paste0(cohort_name, " — Risk score distribution"),
+         subtitle = sprintf("n=%d | events=%d | median cutoff=%.3f",
+                            nrow(df), sum(df$os_status),
+                            median(df$RiskScore)),
+         x = "Patients (sorted by risk score)",
+         y = "Risk score (2-miRNA z-scored)") +
+    theme_bw(base_size=10) +
+    theme(plot.title       = element_text(face="bold", size=11),
+          plot.subtitle    = element_text(color="grey40", size=9),
+          panel.grid.minor = element_blank())
+
+  out_dist <- paste0("RiskDist_2mir_NT_",
+                     gsub("[^A-Za-z0-9]","_", cohort_name), ".png")
+  ggsave(out_dist, p_dist, width=8, height=4, dpi=300)
+  cat("Risk dist saved →", out_dist, "\n")
+
+  list(cohort=cohort_name, n=n_total, events=n_events,
+       HR=hr, HR_lo=hr_lo, HR_hi=hr_hi,
+       cox_p=cox_p, lr_p=lr_p, cindex=cindex,
+       auc_df=auc_df, skipped=FALSE)
+}
+
+# ==============================================================================
+# Re-run validation with fixed function
+# ==============================================================================
+
+luad_nt_val <- validate_2mir_nt(luad_nt, "TCGA-LUAD (Non-Targeted)",
+                                 roc_times=c(12, 24, 36, 60))
+
+lusc_nt_val <- validate_2mir_nt(lusc_nt, "TCGA-LUSC (Non-Targeted)",
+                                 roc_times=c(12, 24, 36, 60))
+
+# ==============================================================================
+# PART 6 — Validate full non-targeted cohorts
+# ==============================================================================
+
+luad_nt_val <- validate_2mir_nt(luad_nt, "TCGA-LUAD (Non-Targeted)",
+                                 roc_times=c(12, 24, 36, 60))
+lusc_nt_val <- validate_2mir_nt(lusc_nt, "TCGA-LUSC (Non-Targeted)",
+                                 roc_times=c(12, 24, 36, 60))
+
+# ==============================================================================
+# PART 7 — Stage annotation + subset validation
+# ==============================================================================
+
+luad_clin <- readRDS("TCGA_LUAD_clinical.rds")
+lusc_clin <- readRDS("TCGA_LUSC_clinical.rds")
+
+# add_stage() — reused from original pipeline
+to_title <- function(x) {
+  sapply(x, function(s) {
+    if (is.na(s)) return(NA_character_)
+    words <- strsplit(tolower(trimws(s)), "\\s+")[[1]]
+    words <- sapply(words, function(w) {
+      if (w %in% c("i","ia","ib","ii","iia","iib",
+                   "iii","iiia","iiib","iv","iva","ivb"))
+        toupper(w)
+      else paste0(toupper(substr(w,1,1)), substr(w,2,nchar(w)))
+    })
+    paste(words, collapse=" ")
+  }, USE.NAMES=FALSE)
+}
+
+add_stage <- function(risk_df, clin_df, cohort_name) {
+  colnames(clin_df) <- tolower(colnames(clin_df))
+  barcode_col <- intersect(c("bcr_patient_barcode","submitter_id","case_id"),
+                            colnames(clin_df))[1]
+  stage_col   <- intersect(c("ajcc_pathologic_stage",
+                               "ajcc_pathologic_tumor_stage",
+                               "tumor_stage","clinical_stage",
+                               "pathologic_stage"),
+                            colnames(clin_df))[1]
+
+  if (is.na(stage_col)) {
+    warning(cohort_name, ": no stage column found")
+    return(risk_df %>% mutate(stage_group=NA_character_,
+                               stage_fine =NA_character_))
+  }
+
+  cat("[STAGE]", cohort_name, "using column:", stage_col, "\n")
+
+  stage_df <- clin_df %>%
+    mutate(case_id   = toupper(substr(.data[[barcode_col]], 1, 12)),
+           stage_raw = to_title(.data[[stage_col]])) %>%
+    select(case_id, stage_raw) %>%
+    distinct(case_id, .keep_all=TRUE) %>%
+    mutate(
+      stage_group = case_when(
+        stage_raw %in% c("Stage I","Stage IA","Stage IB")   ~ "I",
+        stage_raw %in% c("Stage II","Stage IIA","Stage IIB") ~ "II",
+        stage_raw %in% c("Stage III","Stage IIIA","Stage IIIB") ~ "III",
+        stage_raw %in% c("Stage IV","Stage IVA","Stage IVB")  ~ "IV",
+        TRUE ~ NA_character_
+      ),
+      stage_fine = case_when(
+        stage_raw %in% c("Stage I","Stage IA","Stage IB")   ~ "I",
+        stage_raw %in% c("Stage II","Stage IIA","Stage IIB") ~ "II",
+        stage_raw == "Stage IIIA"                             ~ "IIIA",
+        stage_raw == "Stage IIIB"                             ~ "IIIB",
+        stage_raw == "Stage III"                              ~ "III",
+        stage_raw %in% c("Stage IV","Stage IVA","Stage IVB")  ~ "IV",
+        TRUE ~ NA_character_
+      )
+    )
+
+  merged   <- risk_df %>%
+    left_join(stage_df %>% select(case_id, stage_group, stage_fine),
+              by="case_id")
+  n_staged <- sum(!is.na(merged$stage_group))
+  cat(sprintf("[STAGE] %s: %d / %d samples staged\n",
+              cohort_name, n_staged, nrow(merged)))
+  print(table(merged$stage_fine, useNA="ifany"))
+  merged
+}
+
+luad_nt_staged <- add_stage(luad_nt, luad_clin, "TCGA-LUAD (NT)")
+lusc_nt_staged <- add_stage(lusc_nt, lusc_clin, "TCGA-LUSC (NT)")
+
+if (all(is.na(luad_nt_staged$stage_group)))
+  stop("LUAD staging failed — check clinical RDS")
+if (all(is.na(lusc_nt_staged$stage_group)))
+  stop("LUSC staging failed — check clinical RDS")
+
+# Helper: filter subset, re-apply median cutoff, validate
+run_subset <- function(staged_df, stage_values, stage_col,
+                        label, roc_times=c(12,24,36,60)) {
+  sub_df <- staged_df %>%
+    filter(.data[[stage_col]] %in% stage_values) %>%
+    mutate(RiskGroup = factor(
+      ifelse(RiskScore >= median(RiskScore), "High", "Low"),
+      levels = c("Low","High")
+    ))
+  cat(sprintf("\n%s: n=%d | events=%d\n",
+              label, nrow(sub_df), sum(sub_df$os_status)))
+  validate_2mir_nt(sub_df, label, roc_times=roc_times)
+}
+
+# Stage III-IV
+luad_nt_adv  <- run_subset(luad_nt_staged, c("III","IV"), "stage_group",
+                            "TCGA-LUAD NT (Stage III-IV)")
+lusc_nt_adv  <- run_subset(lusc_nt_staged, c("III","IV"), "stage_group",
+                            "TCGA-LUSC NT (Stage III-IV)")
+# Stage IV only
+luad_nt_stIV <- run_subset(luad_nt_staged, "IV", "stage_group",
+                            "TCGA-LUAD NT (Stage IV)",
+                            roc_times=c(12,24,36))
+lusc_nt_stIV <- run_subset(lusc_nt_staged, "IV", "stage_group",
+                            "TCGA-LUSC NT (Stage IV)",
+                            roc_times=c(12,24,36))
+# Stage IIIB+IV
+luad_nt_3b4  <- run_subset(luad_nt_staged, c("IIIB","IV"), "stage_fine",
+                            "TCGA-LUAD NT (Stage IIIB+IV)",
+                            roc_times=c(12,24,36))
+lusc_nt_3b4  <- run_subset(lusc_nt_staged, c("IIIB","IV"), "stage_fine",
+                            "TCGA-LUSC NT (Stage IIIB+IV)",
+                            roc_times=c(12,24,36))
+
+# ==============================================================================
+# PART 8 — Summary table + export
+# ==============================================================================
+
+make_row <- function(label, val) {
+  if (isTRUE(val$skipped)) {
+    return(data.frame(
+      Cohort=label, n=val$n, Events=val$events,
+      HR=NA, HR_lo=NA, HR_hi=NA,
+      Cox_p="skipped", Logrank_p="skipped", Cindex=NA
+    ))
+  }
+  data.frame(
+    Cohort    = label,
+    n         = val$n,
+    Events    = val$events,
+    HR        = round(val$HR,    3),
+    HR_lo     = round(val$HR_lo, 3),
+    HR_hi     = round(val$HR_hi, 3),
+    Cox_p     = formatC(val$cox_p, digits=3, format="g"),
+    Logrank_p = formatC(val$lr_p,  digits=3, format="g"),
+    Cindex    = round(val$cindex,  3)
+  )
+}
+
+summary_nt <- bind_rows(
+  make_row("TCGA-LUAD NT (all stages)",    luad_nt_val),
+  make_row("TCGA-LUSC NT (all stages)",    lusc_nt_val),
+  make_row("TCGA-LUAD NT (Stage III-IV)",  luad_nt_adv),
+  make_row("TCGA-LUSC NT (Stage III-IV)",  lusc_nt_adv),
+  make_row("TCGA-LUAD NT (Stage IV)",      luad_nt_stIV),
+  make_row("TCGA-LUSC NT (Stage IV)",      lusc_nt_stIV),
+  make_row("TCGA-LUAD NT (Stage IIIB+IV)", luad_nt_3b4),
+  make_row("TCGA-LUSC NT (Stage IIIB+IV)", lusc_nt_3b4)
+)
+
+cat("\n══════════ NON-TARGETED 2-miRNA VALIDATION SUMMARY ══════════\n")
+print(summary_nt, row.names=FALSE)
+write.csv(summary_nt, "Validation_summary_2mir_NT.csv", row.names=FALSE)
+
+# AUC table
+all_auc_nt <- bind_rows(
+  luad_nt_val$auc_df,  lusc_nt_val$auc_df,
+  luad_nt_adv$auc_df,  lusc_nt_adv$auc_df,
+  luad_nt_stIV$auc_df, lusc_nt_stIV$auc_df,
+  luad_nt_3b4$auc_df,  lusc_nt_3b4$auc_df
+)
+write.csv(all_auc_nt, "TimeROC_AUC_2mir_NT.csv", row.names=FALSE)
+
+cat("\n✓ All done. Output files:\n")
+cat("  KM plots     : KM_2mir_NT_*.png\n")
+cat("  ROC plots    : TimeROC_2mir_NT_*.png\n")
+cat("  Risk dist    : RiskDist_2mir_NT_*.png\n")
+cat("  Risk scores  : TCGA_LUAD/LUSC_NT_2mir_risk_scores.csv\n")
+cat("  Summary      : Validation_summary_2mir_NT.csv\n")
+cat("  AUC table    : TimeROC_AUC_2mir_NT.csv\n")
+```
+
+#treatment response non-targeted
+```{r}
+# ══════════════════════════════════════════════════════════════════════════
+# RISK SCORE vs PRIMARY THERAPY OUTCOME — NON-TARGETED NSCLC
+# Cohorts  : TCGA-LUAD  |  TCGA-LUSC  |  Pooled
+# Subsets  : (A) All stages  |  (B) Stage III + IV
+# Signature: 2-miRNA z-score (miR-509-3p + miR-377-3p)
+#            hsa-miR-378h excluded — 99% zero RPM in TCGA RNA-seq
+#
+# Inputs (must exist in working directory):
+#   TCGA_LUAD_NT_2mir_risk_scores.csv   ← from SingleMiRNA_Validation.R Part 4
+#   TCGA_LUSC_NT_2mir_risk_scores.csv
+#   TCGA_LUAD_clinical.rds              ← for stage annotation
+#   TCGA_LUSC_clinical.rds
+#   TCGA_LUAD_followup.rds              ← for primary_therapy_outcome_success
+#   TCGA_LUSC_followup.rds
+#   TCGA_LUAD_drug.rds                  ← for treatment type
+#   TCGA_LUSC_drug.rds
+#
+# If followup/drug RDS files missing → set RUN_SUPPLEMENT_DOWNLOAD <- TRUE
+#
+# Outputs: Output_NT_TxResponse/ folder
+# ══════════════════════════════════════════════════════════════════════════
+
+library(TCGAbiolinks)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+library(survival)
+library(survminer)
+library(scales)
+
+OUT_DIR <- "Output_NT_TxResponse"
+dir.create(OUT_DIR, showWarnings = FALSE)
+
+# Stage subset to use for advanced analysis
+ADV_STAGES <- c("III", "IV")
+
+# Minimum group size to run statistics
+MIN_N <- 10
+
+RUN_SUPPLEMENT_DOWNLOAD <- FALSE  # TRUE only on first run
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Helper
+# ══════════════════════════════════════════════════════════════════════════
+
+save_png <- function(p, filename, w = 2200, h = 2000) {
+  path <- file.path(OUT_DIR, filename)
+  png(path, width = w, height = h, res = 300)
+  print(p)
+  dev.off()
+  cat("  Saved:", path, "\n")
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PART 0 — Download clinical supplement if needed
+# ══════════════════════════════════════════════════════════════════════════
+
+if (RUN_SUPPLEMENT_DOWNLOAD) {
+  for (project in c("TCGA-LUAD", "TCGA-LUSC")) {
+    prefix <- gsub("-", "_", project)
+    cat("\nDownloading supplement:", project, "\n")
+    q <- GDCquery(project       = project,
+                  data.category = "Clinical",
+                  data.type     = "Clinical Supplement",
+                  data.format   = "BCR XML")
+    GDCdownload(q, method = "api")
+    fu   <- tryCatch(GDCprepare_clinic(q, clinical.info = "follow_up"),
+                     error = function(e) { cat("  follow_up failed\n"); NULL })
+    drug <- tryCatch(GDCprepare_clinic(q, clinical.info = "drug"),
+                     error = function(e) { cat("  drug failed\n"); NULL })
+    if (!is.null(fu))   saveRDS(fu,   paste0(prefix, "_followup.rds"))
+    if (!is.null(drug)) saveRDS(drug, paste0(prefix, "_drug.rds"))
+    cat("  Saved RDS files for", prefix, "\n")
+  }
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PART 1 — Load NT risk score CSVs
+# ══════════════════════════════════════════════════════════════════════════
+
+cat("\n── Loading NT risk scores ──\n")
+
+luad_nt <- read.csv("TCGA_LUAD_NT_2mir_risk_scores.csv",
+                    stringsAsFactors = FALSE)
+lusc_nt <- read.csv("TCGA_LUSC_NT_2mir_risk_scores.csv",
+                    stringsAsFactors = FALSE)
+
+# Ensure correct types
+luad_nt <- luad_nt %>%
+  mutate(os_months = as.numeric(os_months),
+         os_status = as.integer(os_status),
+         RiskScore = as.numeric(RiskScore),
+         RiskGroup = factor(RiskGroup, levels = c("Low", "High")))
+lusc_nt <- lusc_nt %>%
+  mutate(os_months = as.numeric(os_months),
+         os_status = as.integer(os_status),
+         RiskScore = as.numeric(RiskScore),
+         RiskGroup = factor(RiskGroup, levels = c("Low", "High")))
+
+cat(sprintf("LUAD NT: n=%d | events=%d\n",
+            nrow(luad_nt), sum(luad_nt$os_status)))
+cat(sprintf("LUSC NT: n=%d | events=%d\n",
+            nrow(lusc_nt), sum(lusc_nt$os_status)))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PART 2 — Stage annotation
+# ══════════════════════════════════════════════════════════════════════════
+
+luad_clin <- readRDS("TCGA_LUAD_clinical.rds")
+lusc_clin <- readRDS("TCGA_LUSC_clinical.rds")
+
+to_title_stage <- function(x) {
+  sapply(x, function(s) {
+    if (is.na(s)) return(NA_character_)
+    words <- strsplit(tolower(trimws(s)), "\\s+")[[1]]
+    words <- sapply(words, function(w) {
+      if (w %in% c("i","ia","ib","ii","iia","iib",
+                   "iii","iiia","iiib","iv","iva","ivb"))
+        toupper(w)
+      else paste0(toupper(substr(w, 1, 1)), substr(w, 2, nchar(w)))
+    })
+    paste(words, collapse = " ")
+  }, USE.NAMES = FALSE)
+}
+
+attach_stage <- function(rs_df, clin_df, cohort) {
+  colnames(clin_df) <- tolower(colnames(clin_df))
+  bc_col <- intersect(c("bcr_patient_barcode","submitter_id","case_id"),
+                      colnames(clin_df))[1]
+  stage_col <- intersect(c("ajcc_pathologic_stage",
+                            "ajcc_pathologic_tumor_stage",
+                            "tumor_stage","clinical_stage",
+                            "pathologic_stage"),
+                         colnames(clin_df))[1]
+
+  cat("\n[STAGE]", cohort, "| col:", stage_col, "\n")
+
+  stage_df <- clin_df %>%
+    mutate(case_id   = toupper(substr(.data[[bc_col]], 1, 12)),
+           stage_raw = to_title_stage(.data[[stage_col]])) %>%
+    select(case_id, stage_raw) %>%
+    distinct(case_id, .keep_all = TRUE) %>%
+    mutate(
+      stage_group = case_when(
+        stage_raw %in% c("Stage I","Stage IA","Stage IB")     ~ "I",
+        stage_raw %in% c("Stage II","Stage IIA","Stage IIB")  ~ "II",
+        stage_raw %in% c("Stage III","Stage IIIA","Stage IIIB") ~ "III",
+        stage_raw %in% c("Stage IV","Stage IVA","Stage IVB")  ~ "IV",
+        TRUE ~ NA_character_
+      ),
+      stage_fine = case_when(
+        stage_raw %in% c("Stage I","Stage IA","Stage IB")     ~ "I",
+        stage_raw %in% c("Stage II","Stage IIA","Stage IIB")  ~ "II",
+        stage_raw == "Stage IIIA"                              ~ "IIIA",
+        stage_raw == "Stage IIIB"                              ~ "IIIB",
+        stage_raw == "Stage III"                               ~ "III",
+        stage_raw %in% c("Stage IV","Stage IVA","Stage IVB")  ~ "IV",
+        TRUE ~ NA_character_
+      )
+    )
+
+  merged <- rs_df %>%
+    left_join(stage_df %>% select(case_id, stage_group, stage_fine),
+              by = "case_id")
+
+  cat(sprintf("  Staged: %d / %d\n",
+              sum(!is.na(merged$stage_group)), nrow(merged)))
+  print(table(merged$stage_group, useNA = "ifany"))
+  merged
+}
+
+luad_nt_staged <- attach_stage(luad_nt, luad_clin, "TCGA-LUAD NT")
+lusc_nt_staged <- attach_stage(lusc_nt, lusc_clin, "TCGA-LUSC NT")
+
+if (all(is.na(luad_nt_staged$stage_group)))
+  stop("LUAD NT staging failed — check clinical RDS")
+if (all(is.na(lusc_nt_staged$stage_group)))
+  stop("LUSC NT staging failed — check clinical RDS")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PART 3 — Build primary therapy response table from follow_up supplement
+# ══════════════════════════════════════════════════════════════════════════
+
+luad_fu   <- readRDS("TCGA_LUAD_followup.rds")
+lusc_fu   <- readRDS("TCGA_LUSC_followup.rds")
+
+build_response <- function(fu_df, cohort) {
+  colnames(fu_df) <- tolower(colnames(fu_df))
+  bc_col   <- intersect(c("bcr_patient_barcode","submitter_id","case_id"),
+                        colnames(fu_df))[1]
+  resp_col <- intersect(c("primary_therapy_outcome_success",
+                           "measure_of_response",
+                           "treatment_best_response",
+                           "therapy_outcome_first_course"),
+                        colnames(fu_df))[1]
+
+  cat("\n[RESPONSE]", cohort,
+      "| barcode:", bc_col, "| response col:", resp_col, "\n")
+
+  if (is.na(resp_col)) {
+    cat("  ⚠ No response column. Available:\n",
+        paste(colnames(fu_df), collapse=", "), "\n")
+    return(tibble(case_id=character(),
+                  response_recist=character(),
+                  response_binary=character()))
+  }
+
+  out <- fu_df %>%
+    mutate(
+      case_id      = toupper(substr(.data[[bc_col]], 1, 12)),
+      response_raw = as.character(.data[[resp_col]]),
+      response_recist = case_when(
+        grepl("complete remission|complete response|^CR$",
+              response_raw, ignore.case=TRUE)  ~ "CR",
+        grepl("partial remission|partial response|^PR$",
+              response_raw, ignore.case=TRUE)   ~ "PR",
+        grepl("stable|no change|^SD$",
+              response_raw, ignore.case=TRUE)   ~ "SD",
+        grepl("progress|^PD$",
+              response_raw, ignore.case=TRUE)   ~ "PD",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    filter(!is.na(response_recist)) %>%
+    mutate(resp_rank = match(response_recist, c("CR","PR","SD","PD"))) %>%
+    group_by(case_id) %>%
+    arrange(resp_rank) %>%
+    slice(1) %>%
+    ungroup() %>%
+    mutate(
+      response_binary = case_when(
+        response_recist %in% c("CR","PR") ~ "Responder (CR+PR)",
+        response_recist %in% c("SD","PD") ~ "Non-responder (SD+PD)",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    select(case_id, response_recist, response_binary)
+
+  cat("  Response n =", nrow(out), "\n")
+  print(table(out$response_recist, useNA="ifany"))
+  out
+}
+
+luad_resp <- build_response(luad_fu, "TCGA-LUAD")
+lusc_resp <- build_response(lusc_fu, "TCGA-LUSC")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PART 4 — Build treatment type table from drug supplement
+# ══════════════════════════════════════════════════════════════════════════
+
+luad_drug <- readRDS("TCGA_LUAD_drug.rds")
+lusc_drug <- readRDS("TCGA_LUSC_drug.rds")
+
+build_tx_type <- function(drug_df, cohort) {
+  colnames(drug_df) <- tolower(colnames(drug_df))
+  bc_col <- intersect(c("bcr_patient_barcode","submitter_id","case_id"),
+                      colnames(drug_df))[1]
+  tx_col <- intersect(c("therapy_types","therapy_type",
+                         "pharmaceutical_therapy_drug_name","drug_name"),
+                      colnames(drug_df))[1]
+
+  cat("\n[TX TYPE]", cohort, "| tx col:", tx_col, "\n")
+  if (is.na(tx_col))
+    return(tibble(case_id=character(), tx_type=character()))
+
+  drug_df %>%
+    mutate(
+      case_id = toupper(substr(.data[[bc_col]], 1, 12)),
+      tx_raw  = as.character(.data[[tx_col]]),
+      tx_type = case_when(
+        grepl("chemo|platinum|paclitaxel|gemcitab|pemetrexed|vinorelbine|etoposide|docetaxel|carboplatin|cisplatin",
+              tx_raw, ignore.case=TRUE) &
+          !grepl("immun|checkpoint|pembrolizumab|nivolumab|atezolizumab|durvalumab|ipilimumab",
+                 tx_raw, ignore.case=TRUE) ~ "Chemotherapy",
+        grepl("immun|checkpoint|pembrolizumab|nivolumab|atezolizumab|durvalumab|ipilimumab",
+              tx_raw, ignore.case=TRUE)   ~ "Immunotherapy",
+        grepl("erlotinib|gefitinib|osimertinib|crizotinib|alectinib|bevacizumab|cetuximab|afatinib|targeted",
+              tx_raw, ignore.case=TRUE)   ~ "Targeted Therapy",
+        grepl("radiat|radiation|XRT|SBRT|IMRT",
+              tx_raw, ignore.case=TRUE)   ~ "Radiation",
+        !is.na(tx_raw)                   ~ "Other",
+        TRUE                             ~ NA_character_
+      )
+    ) %>%
+    distinct(case_id, .keep_all=TRUE) %>%
+    select(case_id, tx_raw, tx_type)
+}
+
+luad_tx <- build_tx_type(luad_drug, "TCGA-LUAD")
+lusc_tx <- build_tx_type(lusc_drug, "TCGA-LUSC")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PART 5 — Merge function: risk scores + stage + response + tx type
+# ══════════════════════════════════════════════════════════════════════════
+
+merge_nt <- function(staged_df, resp_df, tx_df, cohort,
+                     stage_filter = NULL) {
+
+  # Optionally filter to advanced stages
+  if (!is.null(stage_filter)) {
+    staged_df <- staged_df %>%
+      filter(stage_group %in% stage_filter)
+    cat(sprintf("\n[FILTER] %s → Stage %s: n=%d\n",
+                cohort, paste(stage_filter, collapse="+"), nrow(staged_df)))
+    # Recompute median RiskGroup WITHIN filtered subset
+    staged_df <- staged_df %>%
+      mutate(RiskGroup = factor(
+        ifelse(RiskScore >= median(RiskScore, na.rm=TRUE), "High", "Low"),
+        levels = c("Low","High")
+      ))
+  }
+
+  out <- staged_df %>%
+    left_join(resp_df, by = "case_id") %>%
+    left_join(tx_df %>% select(case_id, tx_type), by = "case_id") %>%
+    mutate(
+      Cohort          = cohort,
+      response_recist = factor(response_recist, levels=c("CR","PR","SD","PD")),
+      response_binary = factor(response_binary,
+                               levels=c("Responder (CR+PR)",
+                                        "Non-responder (SD+PD)")),
+      tx_type         = factor(tx_type,
+                               levels=c("Chemotherapy","Immunotherapy",
+                                        "Targeted Therapy","Radiation","Other"))
+    )
+
+  cat(sprintf("[MERGE] %s: n=%d | response=%d | tx=%d | High=%d | Low=%d\n",
+              cohort, nrow(out),
+              sum(!is.na(out$response_recist)),
+              sum(!is.na(out$tx_type)),
+              sum(out$RiskGroup=="High", na.rm=TRUE),
+              sum(out$RiskGroup=="Low",  na.rm=TRUE)))
+  out
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PART 6 — Build all 6 datasets
+#   A = All stages:   LUAD | LUSC | Pooled
+#   B = Stage III+IV: LUAD | LUSC | Pooled
+# ══════════════════════════════════════════════════════════════════════════
+
+cat("\n══ Building datasets ══\n")
+
+# ── A: All stages ─────────────────────────────────────────────────────────
+luad_all <- merge_nt(luad_nt_staged, luad_resp, luad_tx, "TCGA-LUAD")
+lusc_all <- merge_nt(lusc_nt_staged, lusc_resp, lusc_tx, "TCGA-LUSC")
+pool_all <- bind_rows(luad_all, lusc_all) %>%
+  mutate(Cohort    = "LUAD+LUSC",
+         RiskGroup = factor(
+           ifelse(RiskScore >= median(RiskScore, na.rm=TRUE), "High", "Low"),
+           levels = c("Low","High")
+         ))
+
+# ── B: Stage III + IV ─────────────────────────────────────────────────────
+luad_adv <- merge_nt(luad_nt_staged, luad_resp, luad_tx,
+                     "TCGA-LUAD", stage_filter = ADV_STAGES)
+lusc_adv <- merge_nt(lusc_nt_staged, lusc_resp, lusc_tx,
+                     "TCGA-LUSC", stage_filter = ADV_STAGES)
+pool_adv <- bind_rows(
+  luad_nt_staged %>% filter(stage_group %in% ADV_STAGES),
+  lusc_nt_staged %>% filter(stage_group %in% ADV_STAGES)
+) %>%
+  left_join(bind_rows(luad_resp, lusc_resp), by = "case_id") %>%
+  left_join(bind_rows(luad_tx,   lusc_tx) %>%
+              select(case_id, tx_type), by = "case_id") %>%
+  mutate(
+    Cohort          = "LUAD+LUSC",
+    RiskGroup       = factor(
+      ifelse(RiskScore >= median(RiskScore, na.rm=TRUE), "High", "Low"),
+      levels = c("Low","High")
+    ),
+    response_recist = factor(response_recist, levels=c("CR","PR","SD","PD")),
+    response_binary = factor(response_binary,
+                             levels=c("Responder (CR+PR)",
+                                      "Non-responder (SD+PD)")),
+    tx_type         = factor(tx_type,
+                             levels=c("Chemotherapy","Immunotherapy",
+                                      "Targeted Therapy","Radiation","Other"))
+  )
+
+cat(sprintf("\n[POOL ADV] LUAD+LUSC Stage%s: n=%d | response=%d\n",
+            paste(ADV_STAGES,collapse="+"),
+            nrow(pool_adv), sum(!is.na(pool_adv$response_recist))))
+
+# Named list: all 6 datasets with descriptive labels
+datasets <- list(
+  "LUAD — All stages"   = luad_all,
+  "LUSC — All stages"   = lusc_all,
+  "LUAD+LUSC — All stages" = pool_all,
+  "LUAD — Stage III+IV" = luad_adv,
+  "LUSC — Stage III+IV" = lusc_adv,
+  "LUAD+LUSC — Stage III+IV" = pool_adv
+)
+
+# Save merged CSVs
+write.csv(luad_all,  file.path(OUT_DIR, "NT_LUAD_AllStages.csv"),      row.names=FALSE)
+write.csv(lusc_all,  file.path(OUT_DIR, "NT_LUSC_AllStages.csv"),      row.names=FALSE)
+write.csv(pool_all,  file.path(OUT_DIR, "NT_Pooled_AllStages.csv"),    row.names=FALSE)
+write.csv(luad_adv,  file.path(OUT_DIR, "NT_LUAD_StageIIIIV.csv"),    row.names=FALSE)
+write.csv(lusc_adv,  file.path(OUT_DIR, "NT_LUSC_StageIIIIV.csv"),    row.names=FALSE)
+write.csv(pool_adv,  file.path(OUT_DIR, "NT_Pooled_StageIIIIV.csv"),  row.names=FALSE)
+cat("✓ 6 merged CSVs saved.\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PART 7 — Colour palettes
+# ══════════════════════════════════════════════════════════════════════════
+
+RECIST_COLS <- c("CR"="#27AE60","PR"="#2ECC71","SD"="#F39C12","PD"="#E74C3C")
+BINARY_COLS <- c("Responder (CR+PR)"="#27AE60","Non-responder (SD+PD)"="#E74C3C")
+TX_COLS     <- c("Chemotherapy"="#3498DB","Immunotherapy"="#9B59B6",
+                 "Targeted Therapy"="#E67E22","Radiation"="#1ABC9C","Other"="#95A5A6")
+
+# KM joint colours — UNNAMED ordered vector (avoids ggsurvplot grey bug)
+JOINT_LEVELS  <- c("Low / Responder (CR+PR)", "Low / Non-responder (SD+PD)",
+                   "High / Responder (CR+PR)", "High / Non-responder (SD+PD)")
+JOINT_PALETTE <- c("#27AE60","#A9DFBF","#E74C3C","#F1948A")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PART 8 — Plot functions
+# ══════════════════════════════════════════════════════════════════════════
+
+# ── 8A: Boxplot (any group variable) ──────────────────────────────────────
+box_compare <- function(df, group_col, group_levels, col_vec,
+                        title_str, x_label, min_n = 5) {
+
+  plot_df <- df %>%
+    filter(!is.na(.data[[group_col]]),
+           as.character(.data[[group_col]]) %in% group_levels) %>%
+    mutate(GV = factor(as.character(.data[[group_col]]), levels=group_levels))
+
+  keep <- plot_df %>%
+    group_by(GV) %>% summarise(n=n(), .groups="drop") %>%
+    filter(n >= min_n) %>% pull(GV) %>% as.character()
+
+  plot_df <- plot_df %>%
+    filter(GV %in% keep) %>%
+    mutate(GV = factor(as.character(GV),
+                       levels=group_levels[group_levels %in% keep]))
+
+  if (length(unique(plot_df$GV)) < 2) {
+    cat("  [SKIP]", title_str, "— <2 groups with n ≥", min_n, "\n")
+    return(NULL)
+  }
+
+  n_grp <- length(unique(plot_df$GV))
+  if (n_grp > 2) {
+    gp  <- kruskal.test(RiskScore ~ GV, data=plot_df)$p.value
+    gtx <- paste0("Kruskal-Wallis p = ", formatC(gp, digits=3, format="g"))
+  } else {
+    gp  <- wilcox.test(RiskScore ~ GV, data=plot_df)$p.value
+    gtx <- paste0("Wilcoxon p = ", formatC(gp, digits=3, format="g"))
+  }
+
+  ns    <- plot_df %>% group_by(GV) %>% summarise(n=n(), .groups="drop")
+  xlabs <- setNames(paste0(ns$GV,"\n(n=",ns$n,")"), as.character(ns$GV))
+  pairs <- combn(levels(plot_df$GV), 2, simplify=FALSE)
+
+  ggplot(plot_df, aes(x=GV, y=RiskScore, fill=GV)) +
+    geom_boxplot(outlier.shape=NA, width=0.55, alpha=0.85, color="grey30") +
+    geom_jitter(width=0.18, size=0.9, alpha=0.5, color="grey20") +
+    stat_compare_means(comparisons=pairs, method="wilcox.test",
+                       label="p.signif", tip.length=0.01,
+                       step.increase=0.10, hide.ns=TRUE) +
+    scale_fill_manual(values=col_vec, guide="none") +
+    scale_x_discrete(labels=xlabs) +
+    labs(title    = title_str,
+         subtitle = paste0(gtx, "  |  2-miRNA NT signature"),
+         x = x_label,
+         y = "2-miRNA Risk Score (z-scored)") +
+    theme_bw(base_size=11) +
+    theme(plot.title       = element_text(face="bold", size=12),
+          plot.subtitle    = element_text(color="grey40", size=10, face="italic"),
+          panel.grid.minor = element_blank(),
+          axis.text.x      = element_text(size=10))
+}
+
+# ── 8B: Stacked bar ───────────────────────────────────────────────────────
+make_stacked_bar <- function(df, title_str) {
+  plot_df <- df %>%
+    filter(!is.na(response_recist), !is.na(RiskGroup)) %>%
+    mutate(response_recist = factor(response_recist, levels=c("CR","PR","SD","PD")),
+           RiskGroup        = factor(RiskGroup, levels=c("Low","High")))
+
+  if (nrow(plot_df) < MIN_N) {
+    cat("  [SKIP]", title_str, "— n <", MIN_N, "\n"); return(NULL)
+  }
+
+  ct  <- tryCatch(chisq.test(table(plot_df$RiskGroup, plot_df$response_recist)),
+                  error=function(e) list(p.value=NA))
+  plb <- ifelse(is.na(ct$p.value), "Chi-sq p = NA",
+                paste0("Chi-sq p = ", formatC(ct$p.value, digits=3, format="g")))
+
+  prop_df <- plot_df %>%
+    group_by(RiskGroup, response_recist) %>%
+    summarise(n=n(), .groups="drop") %>%
+    group_by(RiskGroup) %>%
+    mutate(total=sum(n), pct=100*n/total,
+           label=ifelse(pct>=6, paste0(round(pct,1),"%"), "")) %>%
+    ungroup()
+
+  ggplot(prop_df, aes(x=RiskGroup, y=pct, fill=response_recist)) +
+    geom_col(width=0.6, color="white", linewidth=0.3) +
+    geom_text(aes(label=label), position=position_stack(vjust=0.5),
+              size=3.5, color="white", fontface="bold") +
+    scale_fill_manual(values=RECIST_COLS, name="Response") +
+    scale_y_continuous(labels=function(x) paste0(x,"%"),
+                       expand=c(0,0), limits=c(0,105)) +
+    labs(title    = title_str,
+         subtitle = paste0(plb, "  |  2-miRNA NT signature"),
+         x="Risk Group", y="Proportion of Patients (%)") +
+    theme_bw(base_size=11) +
+    theme(plot.title         = element_text(face="bold", size=12),
+          plot.subtitle      = element_text(color="grey40", size=10, face="italic"),
+          panel.grid.minor   = element_blank(),
+          panel.grid.major.x = element_blank())
+}
+
+# ── 8C: KM risk group × response ──────────────────────────────────────────
+km_risk_x_response <- function(df, title_str, file_slug) {
+  plot_df <- df %>%
+    filter(!is.na(response_binary), !is.na(RiskGroup),
+           !is.na(os_months), !is.na(os_status)) %>%
+    mutate(Joint = paste0(as.character(RiskGroup), " / ",
+                          as.character(response_binary)),
+           Joint = factor(Joint, levels=JOINT_LEVELS)) %>%
+    filter(!is.na(Joint))
+
+  n_groups <- length(unique(droplevels(plot_df$Joint)))
+  if (nrow(plot_df) < MIN_N || n_groups < 2) {
+    cat("  [SKIP]", title_str, "— n =", nrow(plot_df),
+        "| groups =", n_groups, "\n")
+    return(invisible(NULL))
+  }
+
+  cat(sprintf("  [KM] %s: n=%d | events=%d | groups=%d\n",
+              title_str, nrow(plot_df), sum(plot_df$os_status), n_groups))
+
+  # Align palette to only present levels (unnamed → position-based)
+  present_levels  <- JOINT_LEVELS[JOINT_LEVELS %in% unique(plot_df$Joint)]
+  present_palette <- JOINT_PALETTE[JOINT_LEVELS %in% unique(plot_df$Joint)]
+  plot_df <- plot_df %>%
+    mutate(Joint = factor(as.character(Joint), levels=present_levels))
+
+  km_fit <- survfit(Surv(os_months, os_status) ~ Joint, data=plot_df)
+  lr_p   <- 1 - pchisq(
+    survdiff(Surv(os_months, os_status) ~ Joint, data=plot_df)$chisq,
+    df = n_groups - 1
+  )
+
+  x_max <- min(ceiling(quantile(plot_df$os_months, 0.95)/12)*12, 120)
+  brk   <- ifelse(x_max > 60, 24, 12)
+
+  ns      <- plot_df %>%
+    group_by(Joint) %>%
+    summarise(n=n(), ev=sum(os_status), .groups="drop") %>%
+    arrange(match(Joint, present_levels))
+  leg_labs <- paste0(ns$Joint, " (n=", ns$n, ", ev=", ns$ev, ")")
+
+  km_plot <- ggsurvplot(
+    km_fit, data=plot_df,
+    palette             = present_palette,  # unnamed vector — colour fix
+    size                = 0.9,
+    pval                = FALSE,
+    conf.int            = FALSE,
+    risk.table          = TRUE,
+    risk.table.height   = 0.30,
+    risk.table.fontsize = 3,
+    risk.table.y.text   = FALSE,
+    tables.theme        = theme_cleantable(),
+    censor.shape        = "|", censor.size=3,
+    surv.median.line    = "hv",
+    legend.labs         = leg_labs,
+    legend.title        = "",
+    xlab  = "Time (months)",
+    ylab  = "Overall Survival Probability",
+    xlim  = c(0, x_max),
+    break.time.by = brk,
+    ylim  = c(0, 1.02),
+    title = title_str,
+    ggtheme = theme_bw(base_size=10) +
+      theme(plot.title        = element_text(face="bold", size=11),
+            plot.subtitle     = element_text(size=8, color="grey30"),
+            legend.position   = c(0.70, 0.78),
+            legend.background = element_rect(fill="white", color="grey80",
+                                              linewidth=0.3),
+            legend.text       = element_text(size=7.5),
+            panel.grid.minor  = element_blank())
+  )
+  km_plot$plot <- km_plot$plot +
+    labs(subtitle = paste0(
+      "Log-rank p = ", formatC(lr_p, digits=3, format="g"),
+      "  |  2-miRNA NT  |  Dark=Responder · Green=Low · Red=High"
+    ))
+
+  out <- file.path(OUT_DIR, paste0("KM_NT_RiskGroup_x_Response_", file_slug, ".png"))
+  png(out, width=2400, height=2400, res=300)
+  print(km_plot)
+  dev.off()
+  cat("  Saved:", out, "\n")
+}
+
+# ── 8D: Logistic regression ───────────────────────────────────────────────
+run_logistic <- function(df, label) {
+  sub <- df %>%
+    filter(!is.na(response_binary), !is.na(RiskScore)) %>%
+    mutate(Responder = as.integer(response_binary == "Responder (CR+PR)"))
+  if (nrow(sub) < MIN_N || length(unique(sub$Responder)) < 2) {
+    cat("  [SKIP logistic]", label, "\n"); return(NULL)
+  }
+  fit <- glm(Responder ~ RiskScore, data=sub, family=binomial)
+  s   <- summary(fit)
+  or  <- exp(coef(fit)["RiskScore"])
+  ci  <- exp(confint.default(fit)["RiskScore",])
+  p   <- s$coefficients["RiskScore","Pr(>|z|)"]
+  cat(sprintf("  %s: OR=%.3f (%.3f–%.3f) p=%s\n",
+              label, or, ci[1], ci[2], formatC(p, digits=3, format="g")))
+  data.frame(Label=label, n=nrow(sub), n_resp=sum(sub$Responder),
+             OR=round(or,3), OR_lo95=round(ci[1],3), OR_hi95=round(ci[2],3),
+             p_value=formatC(p, digits=3, format="g"))
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PART 9 — Run all plots across all 6 datasets
+# ══════════════════════════════════════════════════════════════════════════
+
+# Metadata for each dataset: label, file slug, stage description
+ds_meta <- list(
+  list(key="LUAD — All stages",        slug="LUAD_AllStages",
+       label="TCGA-LUAD NT (all stages)"),
+  list(key="LUSC — All stages",        slug="LUSC_AllStages",
+       label="TCGA-LUSC NT (all stages)"),
+  list(key="LUAD+LUSC — All stages",   slug="Pooled_AllStages",
+       label="LUAD+LUSC NT (all stages)"),
+  list(key="LUAD — Stage III+IV",      slug="LUAD_StageIIIIV",
+       label="TCGA-LUAD NT (Stage III+IV)"),
+  list(key="LUSC — Stage III+IV",      slug="LUSC_StageIIIIV",
+       label="TCGA-LUSC NT (Stage III+IV)"),
+  list(key="LUAD+LUSC — Stage III+IV", slug="Pooled_StageIIIIV",
+       label="LUAD+LUSC NT (Stage III+IV)")
+)
+
+all_logistic <- list()
+all_summary  <- list()
+
+for (meta in ds_meta) {
+  df    <- datasets[[meta$key]]
+  slug  <- meta$slug
+  label <- meta$label
+
+  cat(sprintf("\n══════ %s ══════\n", label))
+
+  # ── 4-level RECIST boxplot ───────────────────────────────────────────
+  p4 <- box_compare(df, "response_recist", c("CR","PR","SD","PD"),
+                    RECIST_COLS,
+                    paste0(label, "  —  Risk Score by Primary Therapy Outcome"),
+                    "Primary Therapy Outcome (RECIST)")
+  if (!is.null(p4))
+    save_png(p4, paste0("NT_RiskScore_RECIST4_", slug, ".png"))
+
+  # ── Binary boxplot ───────────────────────────────────────────────────
+  p2 <- box_compare(df, "response_binary",
+                    c("Responder (CR+PR)","Non-responder (SD+PD)"),
+                    BINARY_COLS,
+                    paste0(label, "  —  Risk Score by Treatment Response"),
+                    "Treatment Response")
+  if (!is.null(p2))
+    save_png(p2, paste0("NT_RiskScore_ResponseBinary_", slug, ".png"),
+             w=1600, h=1800)
+
+  # ── Treatment type boxplot ───────────────────────────────────────────
+  ptx <- box_compare(df, "tx_type",
+                     c("Chemotherapy","Immunotherapy",
+                       "Targeted Therapy","Radiation","Other"),
+                     TX_COLS,
+                     paste0(label, "  —  Risk Score by Treatment Type"),
+                     "Treatment Type")
+  if (!is.null(ptx))
+    save_png(ptx, paste0("NT_RiskScore_TxType_", slug, ".png"))
+
+  # ── Stacked bar ──────────────────────────────────────────────────────
+  pb <- make_stacked_bar(
+    df, paste0(label, "  —  Response Distribution by Risk Group")
+  )
+  if (!is.null(pb))
+    save_png(pb, paste0("NT_ResponseBar_byRiskGroup_", slug, ".png"),
+             w=1600, h=1800)
+
+  # ── KM risk × response ───────────────────────────────────────────────
+  km_risk_x_response(
+    df,
+    paste0(label, " — OS by Risk Group \u00d7 Primary Therapy Outcome"),
+    slug
+  )
+
+  # ── Logistic regression ──────────────────────────────────────────────
+  lr <- run_logistic(df, label)
+  if (!is.null(lr)) all_logistic[[length(all_logistic)+1]] <- lr
+
+  # ── Per-group summary stats ──────────────────────────────────────────
+  grp_stats <- df %>%
+    filter(!is.na(response_recist)) %>%
+    group_by(Response = as.character(response_recist)) %>%
+    summarise(n=n(),
+              Median_RiskScore = round(median(RiskScore, na.rm=TRUE), 4),
+              Mean_RiskScore   = round(mean(RiskScore,   na.rm=TRUE), 4),
+              SD_RiskScore     = round(sd(RiskScore,     na.rm=TRUE), 4),
+              .groups="drop") %>%
+    mutate(Dataset = label)
+  if (nrow(grp_stats) > 0)
+    all_summary[[length(all_summary)+1]] <- grp_stats
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PART 10 — Write summary CSVs
+# ══════════════════════════════════════════════════════════════════════════
+
+if (length(all_logistic) > 0) {
+  logistic_tbl <- bind_rows(all_logistic)
+  cat("\n═══ Logistic regression: RiskScore → Responder status ═══\n")
+  print(logistic_tbl, row.names=FALSE)
+  write.csv(logistic_tbl,
+            file.path(OUT_DIR, "NT_Logistic_RiskScore_Response.csv"),
+            row.names=FALSE)
+}
+
+if (length(all_summary) > 0) {
+  summary_tbl <- bind_rows(all_summary) %>%
+    select(Dataset, Response, n, Median_RiskScore, Mean_RiskScore, SD_RiskScore)
+  cat("\n═══ Risk Score by Response — Summary ═══\n")
+  print(summary_tbl, row.names=FALSE)
+  write.csv(summary_tbl,
+            file.path(OUT_DIR, "NT_RiskScore_vs_Response_summary.csv"),
+            row.names=FALSE)
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PART 11 — Final output list
+# ══════════════════════════════════════════════════════════════════════════
+
+cat("\n✓ Done. Outputs in:", OUT_DIR, "\n")
+cat(sprintf("  Datasets: 6 (3 cohorts × 2 stage groups)\n"))
+cat(sprintf("  LUAD NT all stages    : n = %d\n", nrow(luad_all)))
+cat(sprintf("  LUSC NT all stages    : n = %d\n", nrow(lusc_all)))
+cat(sprintf("  Pooled NT all stages  : n = %d\n", nrow(pool_all)))
+cat(sprintf("  LUAD NT Stage III+IV  : n = %d\n", nrow(luad_adv)))
+cat(sprintf("  LUSC NT Stage III+IV  : n = %d\n", nrow(lusc_adv)))
+cat(sprintf("  Pooled NT Stage III+IV: n = %d\n", nrow(pool_adv)))
+cat("\n  Per dataset (6 files each):\n")
+cat("  NT_RiskScore_RECIST4_*.png          — boxplot CR/PR/SD/PD\n")
+cat("  NT_RiskScore_ResponseBinary_*.png   — boxplot Responder vs Non-resp\n")
+cat("  NT_RiskScore_TxType_*.png           — boxplot by treatment type\n")
+cat("  NT_ResponseBar_byRiskGroup_*.png    — stacked bar High vs Low\n")
+cat("  NT_RiskGroup_x_Response_*.png       — 4-curve KM\n")
+cat("\n  Summary CSVs:\n")
+cat("  NT_RiskScore_vs_Response_summary.csv\n")
+cat("  NT_Logistic_RiskScore_Response.csv\n")
+cat("  NT_LUAD/LUSC/Pooled_AllStages.csv\n")
+cat("  NT_LUAD/LUSC/Pooled_StageIIIIV.csv\n")
+```
+
+
+
+
+
+
+
+
+
+
+

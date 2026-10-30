@@ -1,0 +1,2345 @@
+---
+title: "z-score pathway"
+output: html_notebook
+---
+
+#miRNA target gene AIC
+```{r}
+# Load libraries
+library(multiMiR)        # miRNA target prediction
+library(clusterProfiler) # Functional enrichment
+library(org.Hs.eg.db)    # Human gene annotation
+library(ggplot2)         # Visualization
+library(enrichplot)      # Enrichment visualization
+library(DOSE)            # Disease enrichment
+library(ReactomePA)      # Reactome pathway analysis
+library(STRINGdb)        # Protein-protein interaction network
+```
+
+#miRNA target gene AIC
+```{r}
+vers_table <- multimir_dbInfoVersions()
+vers_table
+db.tables = multimir_dbTables()
+db.tables
+db.info = multimir_dbInfo()
+db.info
+predicted_tables()
+validated_tables()
+diseasedrug_tables()
+
+
+# Query multiMiR with all available sources
+targets_hsa.miR.509.3p <- get_multimir(org = "hsa", mirna = "hsa-miR-509-3p", table = "validated")
+targets_hsa.miR.377.3p <- get_multimir(org = "hsa", mirna = "hsa-miR-377-3p", table = "validated")
+targets_hsa.miR.miR.378h <- get_multimir(org = "hsa", mirna = "hsa-miR-378h", table = "validated")
+
+
+# Extract unique gene symbols
+target_genes_hsa.miR.509.3p <- unique(targets_hsa.miR.509.3p@data$target_symbol)
+target_genes_hsa.miR.377.3p  <- unique(targets_hsa.miR.377.3p@data$target_symbol)
+target_genes_hsa.miR.378h  <- unique(targets_hsa.miR.miR.378h@data$target_symbol)
+
+
+# Combine target genes from both miRNAs
+target_genes <- unique(c(target_genes_hsa.miR.509.3p, target_genes_hsa.miR.377.3p, target_genes_hsa.miR.378h))
+
+# View top target genes
+head(target_genes)
+
+# Convert to a data frame
+target_genes_df <- data.frame(Gene_Symbol = target_genes)
+
+head(target_genes_df)
+
+# Save as CSV file
+write.csv(target_genes_df, "target_genes_509_377_378h.csv", row.names = FALSE)
+```
+
+
+#hallmark
+```{r}
+#load data of target genes
+data = read.csv("target_genes_509_377_378h.csv")
+
+##manual download database from msigdb
+# Replace "path_to_file.gmt" with the path to your downloaded file
+msigdb_hallmark <- read.gmt("MSigDB/h.all.v2026.1.Hs.symbols.gmt")
+
+# Perform enrichment analysis
+hallmark_ORA <- enricher(gene = data$Gene_Symbol,
+                               TERM2GENE = msigdb_hallmark,
+                               pAdjustMethod = "BH", universe = NULL,
+                               pvalueCutoff = 1,
+                               qvalueCutoff = 1,
+                               minGSSize = 20,
+                               maxGSSize = 1000)
+
+head(hallmark_ORA)
+
+write.csv(hallmark_ORA, file = "hallmark_ORA.csv")
+
+hallmark_ORA_plot <- dotplot(
+  hallmark_ORA,
+  x = "GeneRatio",
+  color = "p.adjust",
+  showCategory = 20,
+  size = NULL,
+  split = NULL,
+  font.size = 8,
+  title = "",
+  label_format = 30,)
+
+# Adjust size and save the plot
+ggsave(filename = "hallmark_ORA_plot.png", plot = hallmark_ORA_plot, width = 8, height = 8)
+
+print(hallmark_ORA_plot)
+```
+
+
+#ALL_CP
+```{r}
+msigdb_all_cp <- read.gmt("MSigDB/c2.cp.v2026.1.Hs.symbols.gmt")
+
+# Perform enrichment analysis
+all_cp <- enricher(gene = data$Gene_Symbol,
+                               TERM2GENE = msigdb_all_cp,
+                               pAdjustMethod = "BH", universe = NULL,
+                               pvalueCutoff = 0.05,
+                               qvalueCutoff = 0.05,
+                               minGSSize = 20,
+                               maxGSSize = 1000)
+
+head(all_cp)
+
+write.csv(all_cp, file = "all_cp.csv")
+
+all_cp_plot <- dotplot(
+  all_cp,
+  x = "GeneRatio",
+  color = "p.adjust",
+  showCategory = 20,
+  size = NULL,
+  split = NULL,
+  font.size = 8,
+  title = "",
+  label_format = 30,)
+
+print(all_cp_plot)
+
+# Adjust size and save the plot
+ggsave(filename = "all_cp.png", plot = all_cp_plot, width = 8, height = 8)
+```
+
+#pathway all_tft
+```{r}
+msigdb_all_tft <- read.gmt("MSigDB/c3.tft.v2026.1.Hs.symbols.gmt")
+
+# Perform enrichment analysis
+all_tft <- enricher(gene = data$Gene_Symbol,
+                               TERM2GENE = msigdb_all_tft,
+                               pAdjustMethod = "BH", universe = NULL,
+                               pvalueCutoff = 0.05,
+                               qvalueCutoff = 0.05,
+                               minGSSize = 20,
+                               maxGSSize = 1000)
+
+head(all_tft)
+
+write.csv(all_tft, file = "all_tft.csv")
+
+all_tft_plot <- dotplot(
+  all_tft,
+  x = "GeneRatio",
+  color = "p.adjust",
+  showCategory = 20,
+  size = NULL,
+  split = NULL,
+  font.size = 8,
+  title = "",
+  label_format = 30,)
+
+print(all_tft_plot)
+
+# Adjust size and save the plot
+ggsave(filename = "all_tft.png", plot = all_tft_plot, width = 8, height = 8)
+```
+
+
+
+#go_ORA
+```{r}
+
+msigdb_all_go<- read.gmt("MSigDB/c5.go.v2026.1.Hs.symbols.gmt")
+
+# Perform enrichment analysis
+go_ORA <- enricher(gene = data$Gene_Symbol,
+                               TERM2GENE = msigdb_all_go,
+                               pAdjustMethod = "BH", universe = NULL,
+                               pvalueCutoff = 0.05,
+                               qvalueCutoff = 1,
+                               minGSSize = 10,
+                               maxGSSize = 1000)
+
+head(go_ORA)
+
+write.csv(go_ORA , file = "all_go_ORA.csv")
+
+go_ora_plot <- dotplot(
+  go_ORA,
+  x = "GeneRatio",
+  color = "p.adjust",
+  showCategory = 20,
+  size = NULL,
+  split = NULL,
+  font.size = 8,
+  title = "",
+  label_format = 30,)
+
+print(go_ora_plot)
+
+# Adjust size and save the plot
+ggsave(filename = "go_ora_plot.png", plot = go_ora_plot, width = 8, height = 8)
+```
+
+#reactome
+```{r}
+#Replace "path_to_file.gmt" with the path to your downloaded file
+msigdb_reactome <- read.gmt("MSigDB/c2.cp.reactome.v2026.1.Hs.symbols.gmt")
+
+# Perform enrichment analysis
+reactome_ORA <- enricher(gene = data$Gene_Symbol,
+                               TERM2GENE = msigdb_reactome,
+                               pAdjustMethod = "BH", universe = NULL,
+                               pvalueCutoff = 0.05,
+                               qvalueCutoff = 0.2,
+                               minGSSize = 50,
+                               maxGSSize = 1000)
+
+head(reactome_ORA)
+
+write.csv(reactome_ORA, file = "reactome_ORA_dead.csv")
+
+reactome_ORA_plot <- dotplot(
+  reactome_ORA,
+  x = "GeneRatio",
+  color = "p.adjust",
+  showCategory = 20,
+  size = NULL,
+  split = NULL,
+  font.size = 8,
+  title = "",
+  label_format = 30,)
+
+print(reactome_ORA_plot)
+
+# Adjust size and save the plot
+ggsave(filename = "reactome_ORA_plot.png", plot = reactome_ORA_plot, width = 8, height = 8)
+```
+
+
+#KEGG
+```{r}
+#Replace "path_to_file.gmt" with the path to your downloaded file
+msigdb_KEGG <- read.gmt("MSigDB/c2.cp.kegg_legacy.v2026.1.Hs.symbols.gmt")
+
+# Perform enrichment analysis
+KEGG_ORA <- enricher(gene = data$Gene_Symbol,
+                               TERM2GENE = msigdb_KEGG,
+                               pAdjustMethod = "BH", universe = NULL,
+                               pvalueCutoff = 0.05,
+                               qvalueCutoff = 1,
+                               minGSSize = 20,
+                               maxGSSize = 1000)
+
+head(KEGG_ORA)
+
+write.csv(KEGG_ORA, file = "KEGG_ORA.csv")
+
+KEGG_ORA_plot <- dotplot(
+  KEGG_ORA,
+  x = "GeneRatio",
+  color = "p.adjust",
+  showCategory = 20,
+  size = NULL,
+  split = NULL,
+  font.size = 8,
+  title = "",
+  label_format = 30,)
+
+print(KEGG_ORA_plot)
+
+# Adjust size and save the plot
+ggsave(filename = "KEGG_ORA_plot.png", plot = KEGG_ORA_plot, width = 8, height = 8)
+
+```
+
+
+#KEGG medicus
+```{r}
+#Replace "path_to_file.gmt" with the path to your downloaded file
+msigdb_kegg_medicus <- read.gmt("MSigDB/c2.cp.kegg_medicus.v2026.1.Hs.symbols.gmt")
+
+# Perform enrichment analysis
+KEGG_medicus_ORA <- enricher(gene = data$Gene_Symbol,
+                               TERM2GENE = msigdb_kegg_medicus,
+                               pAdjustMethod = "BH", universe = NULL,
+                               pvalueCutoff = 1,
+                               qvalueCutoff = 1,
+                               minGSSize = 20,
+                               maxGSSize = 1000)
+
+head(KEGG_medicus_ORA)
+
+write.csv(KEGG_medicus_ORA, file = "KEGG_medicus_ORA.csv")
+
+KEGG_medicus_ORA_plot <- dotplot(
+  KEGG_medicus_ORA,
+  x = "GeneRatio",
+  color = "p.adjust",
+  showCategory = 20,
+  size = NULL,
+  split = NULL,
+  font.size = 8,
+  title = "",
+  label_format = 30,)
+
+print(KEGG_medicus_ORA_plot)
+
+# Adjust size and save the plot
+ggsave(filename = "KEGG_medicus_ORA_plot.png", plot = KEGG_medicus_ORA_plot, width = 8, height = 8)
+
+```
+
+
+#biocarta
+```{r}
+#Replace "path_to_file.gmt" with the path to your downloaded file
+msigdb_biocarta<- read.gmt("MSigDB/c2.cp.biocarta.v2026.1.Hs.symbols.gmt")
+
+# Perform enrichment analysis
+biocarta_ORA <- enricher(gene = data$Gene_Symbol,
+                               TERM2GENE = msigdb_biocarta,
+                               pAdjustMethod = "BH", universe = NULL,
+                               pvalueCutoff = 1,
+                               qvalueCutoff = 1,
+                               minGSSize = 20,
+                               maxGSSize = 1000)
+
+head(biocarta_ORA)
+
+write.csv(biocarta_ORA, file = "biocarta_ORA.csv")
+
+biocarta_ORA_plot <- dotplot(
+  biocarta_ORA,
+  x = "GeneRatio",
+  color = "p.adjust",
+  showCategory = 20,
+  size = NULL,
+  split = NULL,
+  font.size = 8,
+  title = "",
+  label_format = 30,)
+
+print(biocarta_ORA_plot)
+
+# Adjust size and save the plot
+ggsave(filename = "biocarta_ORA_plot.png", plot = biocarta_ORA_plot, width = 8, height = 8)
+```
+
+
+#Wiki_pathway
+```{r}
+#Replace "path_to_file.gmt" with the path to your downloaded file
+msigdb_WIKI <- read.gmt("MSigDB/c2.cp.wikipathways.v2026.1.Hs.symbols.gmt")
+
+# Perform enrichment analysis
+wiki_ORA <- enricher(gene = data$Gene_Symbol,
+                               TERM2GENE = msigdb_WIKI,
+                               pAdjustMethod = "BH", universe = NULL,
+                               pvalueCutoff = 0.05,
+                               qvalueCutoff = 1,
+                               minGSSize = 20,
+                               maxGSSize = 1000)
+
+head(wiki_ORA)
+
+write.csv(wiki_ORA, file = "wiki_ORA.csv")
+
+wiki_ORA_plot <- dotplot(
+  wiki_ORA,
+  x = "GeneRatio",
+  color = "p.adjust",
+  showCategory = 20,
+  size = NULL,
+  split = NULL,
+  font.size = 8,
+  title = "",
+  label_format = 30,)
+
+print(wiki_ORA_plot)
+
+# Adjust size and save the plot
+ggsave(filename = "wiki_ORA_plot.png", plot = wiki_ORA_plot, width = 8, height = 8)
+
+```
+
+#PID 
+```{r}
+#Replace "path_to_file.gmt" with the path to your downloaded file
+msigdb_PID <- read.gmt("MSigDB/c2.cp.pid.v2026.1.Hs.symbols.gmt")
+
+# Perform enrichment analysis
+PID_ORA <- enricher(gene = data$Gene_Symbol,
+                               TERM2GENE = msigdb_PID,
+                               pAdjustMethod = "BH", universe = NULL,
+                               pvalueCutoff = 1,
+                               qvalueCutoff = 1,
+                               minGSSize = 10,
+                               maxGSSize = 1000)
+
+head(PID_ORA)
+
+write.csv(PID_ORA, file = "PID_ORA.csv")
+
+PID_ORA_plot <- dotplot(
+  PID_ORA,
+  x = "GeneRatio",
+  color = "p.adjust",
+  showCategory = 20,
+  size = NULL,
+  split = NULL,
+  font.size = 8,
+  title = "",
+  label_format = 30,)
+
+print(PID_ORA_plot)
+
+# Adjust size and save the plot
+ggsave(filename = "PID_ORA_plot.png", plot = PID_ORA_plot, width = 8, height = 8)
+
+```
+
+#GO_MF
+```{r}
+#Replace "path_to_file.gmt" with the path to your downloaded file
+msigdb_GO_MF <- read.gmt("MSigDB/c5.go.mf.v2026.1.Hs.symbols.gmt")
+
+# Perform enrichment analysis
+GO_MF_ORA <- enricher(gene = data$Gene_Symbol,
+                               TERM2GENE = msigdb_GO_MF,
+                               pAdjustMethod = "BH", universe = NULL,
+                               pvalueCutoff = 0.05,
+                               qvalueCutoff = 1,
+                               minGSSize = 30,
+                               maxGSSize = 1000)
+
+head(GO_MF_ORA)
+
+write.csv(GO_MF_ORA, file = "GO_MF_ORA.csv")
+
+GO_MF_ORA_plot <- dotplot(
+  GO_MF_ORA,
+  x = "GeneRatio",
+  color = "p.adjust",
+  showCategory = 20,
+  size = NULL,
+  split = NULL,
+  font.size = 8,
+  title = "",
+  label_format = 30,)
+
+print(GO_MF_ORA_plot)
+
+# Adjust size and save the plot
+ggsave(filename = "GO_MF_ORA_plot.png", plot = GO_MF_ORA_plot, width = 8, height = 8)
+
+
+# Create the bar plot from your GO_BP_ORA results
+# This will show the top 20 categories, with bars colored by their adjusted p-value.
+GO_MF_ORA_barplot <- barplot(GO_MF_ORA, 
+                           showCategory = 20, 
+                           font.size = 8,
+                           title = "GO Biological Process Enrichment")
+
+# Print the plot to the R viewer
+print(GO_MF_ORA_barplot)
+
+
+# Save the bar plot to a file
+ggsave(filename = "GO_MF_ORA_barplot.png", 
+       plot = GO_MF_ORA_barplot, 
+       width = 8, 
+       height = 8)
+```
+
+
+#GO_BP
+```{r}
+#Replace "path_to_file.gmt" with the path to your downloaded file
+msigdb_GO_BP <- read.gmt("MSigDB/c5.go.bp.v2026.1.Hs.symbols.gmt")
+
+# Perform enrichment analysis
+GO_BP_ORA <- enricher(gene = data$Gene_Symbol,
+                               TERM2GENE = msigdb_GO_BP,
+                               pAdjustMethod = "BH", universe = NULL,
+                               pvalueCutoff = 0.05,
+                               qvalueCutoff = 1,
+                               minGSSize = 100,
+                               maxGSSize = 1000)
+
+head(GO_BP_ORA)
+
+write.csv(GO_BP_ORA, file = "GO_BP_ORA.csv")
+
+GO_BP_ORA_plot <- dotplot(
+  GO_BP_ORA,
+  x = "GeneRatio",
+  color = "p.adjust",
+  showCategory = 20,
+  size = NULL,
+  split = NULL,
+  font.size = 8,
+  title = "",
+  label_format = 30,)
+
+print(GO_BP_ORA_plot)
+
+# Adjust size and save the plot
+ggsave(filename = "GO_BP_ORA_plot.png", plot = GO_BP_ORA_plot, width = 8, height = 8)
+
+
+# Create the bar plot from your GO_BP_ORA results
+# This will show the top 20 categories, with bars colored by their adjusted p-value.
+GO_BP_ORA_barplot <- barplot(GO_BP_ORA, 
+                             showCategory = 20, 
+                             label_format = 30) + # Use label_format instead of font.size for wrapping
+  ggtitle("GO Biological Process Enrichment") +
+  theme(axis.text.y = element_text(size = 8)) # Set font size here instead
+
+# Print the plot to the R viewer
+print(GO_BP_ORA_barplot)
+
+
+# Save the bar plot to a file
+ggsave(filename = "GO_BP_ORA_barplot.png", 
+       plot = GO_BP_ORA_barplot, 
+       width = 8, 
+       height = 8)
+```
+
+#GO_CC
+```{r}
+#Replace "path_to_file.gmt" with the path to your downloaded file
+msigdb_GO_CC <- read.gmt("MSigDB/c5.go.cc.v2026.1.Hs.symbols.gmt")
+
+# Perform enrichment analysis
+GO_CC_ORA <- enricher(gene = data$Gene_Symbol,
+                               TERM2GENE = msigdb_GO_CC,
+                               pAdjustMethod = "BH", universe = NULL,
+                               pvalueCutoff = 0.05,
+                               qvalueCutoff = 1,
+                               minGSSize = 50,
+                               maxGSSize = 1000)
+
+head(GO_CC_ORA)
+
+write.csv(GO_CC_ORA, file = "GO_CC_ORA.csv")
+
+GO_CC_ORA_plot <- dotplot(
+  GO_CC_ORA,
+  x = "GeneRatio",
+  color = "p.adjust",
+  showCategory = 20,
+  size = NULL,
+  split = NULL,
+  font.size = 8,
+  title = "",
+  label_format = 30,)
+
+print(GO_CC_ORA_plot)
+
+# Adjust size and save the plot
+ggsave(filename = "GO_CC_ORA_plot.png", plot = GO_CC_ORA_plot, width = 8, height = 8)
+
+# Create the bar plot from your GO_BP_ORA results
+# This will show the top 20 categories, with bars colored by their adjusted p-value.
+GO_CC_ORA_barplot <- barplot(GO_CC_ORA, 
+                           showCategory = 20, 
+                           font.size = 8,
+                           title = "GO Biological Process Enrichment")
+
+# Print the plot to the R viewer
+print(GO_CC_ORA_barplot)
+
+
+# Save the bar plot to a file
+ggsave(filename = "GO_CC_ORA_barplot.png", 
+       plot = GO_CC_ORA_barplot, 
+       width = 8, 
+       height = 8)
+```
+
+#c6_oncogenic
+```{r}
+#Replace "path_to_file.gmt" with the path to your downloaded file
+msigdb_c6_oncogenic <- read.gmt("MSigDB/c6.all.v2026.1.Hs.symbols.gmt")
+
+# Perform enrichment analysis
+msigdb_c6_oncogenic_ORA <- enricher(gene = data$Gene_Symbol,
+                               TERM2GENE = msigdb_c6_oncogenic,
+                               pAdjustMethod = "BH", universe = NULL,
+                               pvalueCutoff = 1,
+                               qvalueCutoff = 1,
+                               minGSSize = 10,
+                               maxGSSize = 1000)
+
+head(msigdb_c6_oncogenic_ORA)
+
+write.csv(msigdb_c6_oncogenic_ORA, file = "msigdb_c6_oncogenic_ORA.csv")
+
+msigdb_c6_oncogenic_ORA_plot <- dotplot(
+  msigdb_c6_oncogenic_ORA,
+  x = "GeneRatio",
+  color = "p.adjust",
+  showCategory = 20,
+  size = NULL,
+  split = NULL,
+  font.size = 8,
+  title = "",
+  label_format = 30,)
+
+print(msigdb_c6_oncogenic_ORA_plot)
+
+# Adjust size and save the plot
+ggsave(filename = "msigdb_c6_oncogenic_ORA_plot.png", plot = msigdb_c6_oncogenic_ORA_plot, width = 8, height = 8)
+```
+
+#PPI
+```{r}
+library(STRINGdb)
+library(igraph)
+library(dplyr)
+
+# --- 1. Load and Initialize ---
+target_genes <- read.csv("target_genes_509_377_378h.csv")
+
+# Rename to match STRINGdb mapping expectation
+de_results_string <- data.frame(
+  gene = target_genes$Gene_Symbol,
+  stringsAsFactors = FALSE
+)
+
+string_db <- STRINGdb$new(version = "11.5", species = 9606,
+                           score_threshold = 700, input_directory = "")
+
+# --- 2. Mapping and Handling Duplicates ---
+mapped <- string_db$map(de_results_string, "gene", removeUnmappedRows = TRUE)
+
+# Convert to standard data frame
+mapped_df <- as.data.frame(mapped)
+mapped_df <- mapped_df[!is.na(mapped_df$STRING_id) & mapped_df$STRING_id != "", ]
+
+# Remove duplicate STRING_ids (keep first occurrence, no logFC to rank by)
+mapped_unique <- mapped_df[!duplicated(mapped_df$STRING_id), ]
+
+# Re-organize so STRING_id is the first column
+mapped_final <- mapped_unique[, c("STRING_id", setdiff(names(mapped_unique), "STRING_id"))]
+mapped_final$STRING_id <- as.character(mapped_final$STRING_id)
+
+cat("Mapped genes:", nrow(mapped_final), "\n")
+
+# --- 3. Build the Network ---
+interactions <- string_db$get_interactions(mapped_final$STRING_id)
+
+ppi_network <- graph_from_data_frame(
+  d = interactions,
+  vertices = mapped_final,
+  directed = FALSE
+)
+ppi_network <- simplify(ppi_network)
+
+print(paste("Network built with", vcount(ppi_network), "nodes and",
+            ecount(ppi_network), "edges."))
+
+# --- 4. Hub Analysis ---
+V(ppi_network)$Degree       <- degree(ppi_network)
+V(ppi_network)$Betweenness  <- betweenness(ppi_network)
+V(ppi_network)$Closeness    <- closeness(ppi_network)  # added extra metric
+
+hub_table <- data.frame(
+  STRING_ID   = V(ppi_network)$name,
+  Gene        = V(ppi_network)$gene,
+  Degree      = V(ppi_network)$Degree,
+  Betweenness = V(ppi_network)$Betweenness,
+  Closeness   = V(ppi_network)$Closeness
+)
+
+hub_table <- hub_table[order(-hub_table$Degree), ]
+
+write.csv(hub_table, "hub_analysis_miRNA_targets.csv", row.names = FALSE)
+
+# Show top 10 hub genes
+head(hub_table, 10)
+```
+
+
+
+```{r}
+library(ggraph)
+library(ggplot2)
+
+# --- 1. Take top 50 hubs by degree ---
+top_50_hubs <- hub_table$STRING_ID[1:50]
+ppi_top_hubs <- induced_subgraph(ppi_network, vids = top_50_hubs)
+
+# --- 2. Plot colored by Betweenness instead of logFC ---
+gg_targets <- ggraph(ppi_top_hubs, layout = "nicely") +
+  geom_edge_link(alpha = 0.2, color = "grey") +
+  geom_node_point(aes(color = Betweenness, size = Degree)) +
+  geom_node_text(aes(label = gene), repel = TRUE, size = 3, fontface = "bold") +
+  scale_color_gradient(low = "lightblue", high = "darkred") +
+  theme_graph() +
+  labs(title = "Top 50 Hub Genes - miRNA Target PPI Network",
+       color = "Betweenness",
+       size = "Degree")
+
+print(gg_targets)
+
+# --- 3. Save ---
+ggsave("PPI_miRNA_targets_Top50.png", gg_targets, width = 10, height = 8, dpi = 300)
+```
+
+
+#metrics
+```{r}
+library(igraph)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+# --- 1. Function to calculate metrics ---
+calculate_hub_metrics <- function(g) {
+  df <- data.frame(
+    gene        = V(g)$gene,
+    Degree      = degree(g),
+    Betweenness = betweenness(g, normalized = TRUE),
+    PageRank    = page_rank(g)$vector,
+    Eigenvector = eigen_centrality(g)$vector
+  )
+  
+  df <- df %>%
+    mutate(
+      z_Deg = scale(Degree),
+      z_Bet = scale(Betweenness),
+      z_Pag = scale(PageRank),
+      z_Eig = scale(Eigenvector),
+      Composite_Score = (z_Deg + z_Bet + z_Pag + z_Eig) / 4
+    ) %>%
+    arrange(desc(Composite_Score)) %>%
+    head(20)
+  
+  return(df)
+}
+
+# --- 2. Apply to miRNA target network ---
+hub_data <- calculate_hub_metrics(ppi_network)
+
+# --- 3. Save full hub metrics table ---
+write.csv(hub_data, "hub_metrics_miRNA_targets.csv", row.names = FALSE)
+
+# --- 4. Helper function for bar charts ---
+make_hub_plot <- function(df, col_name, title, x_lab, fill_color) {
+  ggplot(df, aes(x = reorder(gene, Composite_Score), y = !!sym(col_name))) +
+    geom_bar(stat = "identity", fill = fill_color, width = 0.7) +
+    geom_text(aes(label = sprintf("%.3f", !!sym(col_name))),
+              hjust = -0.1, size = 3) +
+    coord_flip() +
+    theme_classic() +
+    labs(title = title, x = NULL, y = x_lab) +
+    theme(axis.line.y  = element_blank(),
+          axis.ticks.y = element_blank(),
+          plot.title   = element_text(size = 10, face = "italic", hjust = 0.5)) +
+    scale_y_continuous(expand = expansion(mult = c(0, .2)))
+}
+
+# --- 5. Create 5 individual plots ---
+p1 <- make_hub_plot(hub_data, "Composite_Score", "Composite Hub Score",   "(mean z-score)",            "#FFCE44")
+p2 <- make_hub_plot(hub_data, "Degree",          "Degree",                "(# direct interactions)",   "#6096BA")
+p3 <- make_hub_plot(hub_data, "Betweenness",     "Betweenness Centrality","(bridge importance)",       "#D6824D")
+p4 <- make_hub_plot(hub_data, "PageRank",        "PageRank",              "(network influence)",       "#5E7453")
+p5 <- make_hub_plot(hub_data, "Eigenvector",     "Eigenvector Centrality","(hub-of-hubs score)",       "#8E5BB0")
+
+# --- 6. Combine with patchwork ---
+final_hub_plot <- (p1 | p2 | p3 | p4 | p5) +
+  plot_annotation(
+    title = "Hub Gene Analysis — miRNA Target Network (509-3p / 377-3p / 378h)",
+    theme = theme(plot.title = element_text(size = 16, face = "bold",
+                                            hjust = 0.5, color = "#225577"))
+  )
+
+# --- 7. Print and Save ---
+print(final_hub_plot)
+ggsave("Hub_Gene_Analysis_miRNA_targets.png", final_hub_plot, width = 20, height = 10, dpi = 300)
+```
+
+#miRNA-specific annotation on PPI network
+```{r}
+library(ggraph)
+library(igraph)
+library(dplyr)
+
+# --- 1. Rebuild per-miRNA gene lists ---
+gene_509  <- unique(targets_hsa.miR.509.3p@data$target_symbol)
+gene_377  <- unique(targets_hsa.miR.377.3p@data$target_symbol)
+gene_378h <- unique(targets_hsa.miR.miR.378h@data$target_symbol)
+
+# --- 2. Assign category to each gene ---
+all_genes <- data.frame(gene = unique(c(gene_509, gene_377, gene_378h)),
+                        stringsAsFactors = FALSE)
+
+all_genes$category <- case_when(
+  all_genes$gene %in% gene_509  & all_genes$gene %in% gene_377  & all_genes$gene %in% gene_378h ~ "All 3",
+  all_genes$gene %in% gene_509  & all_genes$gene %in% gene_377  ~ "509 & 377",
+  all_genes$gene %in% gene_509  & all_genes$gene %in% gene_378h ~ "509 & 378h",
+  all_genes$gene %in% gene_377  & all_genes$gene %in% gene_378h ~ "377 & 378h",
+  all_genes$gene %in% gene_509  ~ "miR-509-3p only",
+  all_genes$gene %in% gene_377  ~ "miR-377-3p only",
+  all_genes$gene %in% gene_378h ~ "miR-378h only",
+  TRUE ~ "Unknown"
+)
+
+# --- 3. Annotate vertices in top 50 hub subgraph ---
+top_50_hubs <- hub_table$STRING_ID[1:50]
+ppi_top50   <- induced_subgraph(ppi_network, vids = top_50_hubs)
+
+# Match category to each node
+node_categories <- all_genes$category[match(V(ppi_top50)$gene, all_genes$gene)]
+node_categories[is.na(node_categories)] <- "Unknown"
+V(ppi_top50)$category <- node_categories
+
+# --- 4. Plot ---
+category_colors <- c(
+  "miR-509-3p only" = "#4E79A7",
+  "miR-377-3p only" = "#F28E2B",
+  "miR-378h only"   = "#59A14F",
+  "509 & 377"       = "#B07AA1",
+  "509 & 378h"      = "#76B7B2",
+  "377 & 378h"      = "#FF9DA7",
+  "All 3"           = "#E15759",
+  "Unknown"         = "grey80"
+)
+
+gg_annotated <- ggraph(ppi_top50, layout = "nicely") +
+  geom_edge_link(alpha = 0.2, color = "grey") +
+  geom_node_point(aes(color = category, size = Degree)) +
+  geom_node_text(aes(label = gene), repel = TRUE, size = 3, fontface = "bold") +
+  scale_color_manual(values = category_colors) +
+  theme_graph() +
+  labs(title = "Top 50 Hub Genes — Colored by miRNA Source",
+       color = "miRNA Source",
+       size  = "Degree")
+
+print(gg_annotated)
+ggsave("PPI_miRNA_annotated_Top50.png", gg_annotated, 
+       width = 12, height = 10, dpi = 300)
+```
+
+
+#Upset plot 
+```{r}
+#install.packages("UpSetR")
+library(UpSetR)
+
+# --- 1. Build membership list ---
+upset_input <- list(
+  "miR-509-3p" = gene_509,
+  "miR-377-3p" = gene_377,
+  "miR-378h"   = gene_378h
+)
+
+# --- 2. Convert to binary matrix for UpSetR ---
+upset_data <- fromList(upset_input)
+
+# --- 3. Plot ---
+png("UpSet_miRNA_targets.png", width = 2400, height = 1600, res = 300)
+upset(upset_data,
+      sets              = c("miR-509-3p", "miR-377-3p", "miR-378h"),
+      order.by          = "freq",
+      sets.bar.color    = c("#4E79A7", "#F28E2B", "#59A14F"),
+      main.bar.color    = "#225577",
+      text.scale        = 1.5,
+      point.size        = 3,
+      line.size         = 0.8,
+      mainbar.y.label   = "Number of Target Genes",
+      sets.x.label      = "Total Targets per miRNA",
+      mb.ratio          = c(0.6, 0.4))
+dev.off()
+
+# --- 4. Summary of overlaps ---
+shared_all3    <- Reduce(intersect, upset_input)
+shared_509_377 <- intersect(gene_509, gene_377)
+shared_509_378 <- intersect(gene_509, gene_378h)
+shared_377_378 <- intersect(gene_377, gene_378h)
+
+cat("Shared by all 3 miRNAs:      ", length(shared_all3),    "\n")
+cat("Shared by 509 & 377:         ", length(shared_509_377), "\n")
+cat("Shared by 509 & 378h:        ", length(shared_509_378), "\n")
+cat("Shared by 377 & 378h:        ", length(shared_377_378), "\n")
+
+# Save shared gene lists
+write.csv(data.frame(gene = shared_all3),    "shared_all3_miRNAs.csv",    row.names = FALSE)
+write.csv(data.frame(gene = shared_509_377), "shared_509_377.csv", row.names = FALSE)
+write.csv(data.frame(gene = shared_509_378), "shared_509_378h.csv", row.names = FALSE)
+write.csv(data.frame(gene = shared_377_378), "shared_377_378h.csv", row.names = FALSE)
+```
+
+
+#select theme
+```{r}
+# =============================================================================
+# ORA Dot Plot — miR-509-3p / miR-377-3p / miR-378h Target Genes
+# Publication-quality figure for main manuscript
+#
+# Input files required (same directory as this script):
+#   all_go_ORA.csv   — GO terms (BP + MF + CC)
+#   all_cp.csv       — Canonical pathways (KEGG, Reactome, WikiPathways, PID)
+#   hallmark_ORA.csv — MSigDB Hallmark gene sets
+#   all_tft.csv      — Transcription factor target gene sets
+#
+# Output:
+#   ORA_dotplot_main.pdf  (vector, 8 x 10 in)
+#   ORA_dotplot_main.png  (300 dpi, 8 x 10 in)
+# =============================================================================
+
+# ── 0. Load packages ──────────────────────────────────────────────────────────
+library(tidyverse)   # ggplot2, dplyr, readr, forcats, stringr
+library(scales)      # pretty_breaks, scientific
+library(ggtext)      # element_markdown for rich text (optional)
+
+# ── 1. Read input files ───────────────────────────────────────────────────────
+go_df       <- read_csv("all_go_ORA.csv",      show_col_types = FALSE)
+cp_df       <- read_csv("all_cp.csv",           show_col_types = FALSE)
+hallmark_df <- read_csv("hallmark_ORA.csv",     show_col_types = FALSE)
+tft_df      <- read_csv("all_tft.csv",          show_col_types = FALSE)
+
+# Tag each data frame with a source database label (for annotation)
+go_df       <- go_df       %>% mutate(Source_DB = "GO")
+cp_df       <- cp_df       %>% mutate(Source_DB = "CP")
+hallmark_df <- hallmark_df %>% mutate(Source_DB = "Hallmark")
+tft_df      <- tft_df      %>% mutate(Source_DB = "TFT")
+
+# Combine all into one master data frame
+all_ora <- bind_rows(go_df, cp_df, hallmark_df, tft_df)
+
+# ── 2. Define curated 18 terms ────────────────────────────────────────────────
+# Theme order controls top-to-bottom facet ordering
+# Term order within theme is controlled later by FoldEnrichment
+
+curated <- tribble(
+  ~Description,                                                              ~Display_Label,                      ~Theme,                    ~DB_label,
+  "GOBP_CHROMATIN_REMODELING",                                               "Chromatin Remodeling",               "Epigenetic Reprogramming", "GO-BP",
+  "GOBP_CHROMATIN_ORGANIZATION",                                             "Chromatin Organization",             "Epigenetic Reprogramming", "GO-BP",
+  "GOMF_HISTONE_MODIFYING_ACTIVITY",                                         "Histone Modifying Activity",         "Epigenetic Reprogramming", "GO-MF",
+  "GOBP_MIRNA_METABOLIC_PROCESS",                                            "miRNA Metabolic Process",            "miRNA Feedback Loop",      "GO-BP",
+  "KEGG_PATHWAYS_IN_CANCER",                                                 "Pathways in Cancer",                 "Oncogenic Signaling",      "KEGG",
+  "REACTOME_SIGNALING_BY_RECEPTOR_TYROSINE_KINASES",                         "RTK Signaling",                      "Oncogenic Signaling",      "Reactome",
+  "REACTOME_PTEN_REGULATION",                                                "PTEN Regulation",                    "Oncogenic Signaling",      "Reactome",
+  "REACTOME_KEAP1_NFE2L2_PATHWAY",                                           "KEAP1\u2013NRF2 Pathway",            "Stress Resistance",        "Reactome",
+  "HALLMARK_APOPTOSIS",                                                      "Apoptosis",                          "Cell Survival",            "Hallmark",
+  "HALLMARK_PROTEIN_SECRETION",                                              "Protein Secretion",                  "Cell Survival",            "Hallmark",
+  "WP_VEGFAVEGFR2_SIGNALING",                                                "VEGFA\u2013VEGFR2 Signaling",        "Angiogenesis & Invasion",  "WikiPathways",
+  "WP_EPITHELIAL_TO_MESENCHYMAL_TRANSITION_IN_COLORECTAL_CANCER",            "Epithelial\u2013Mesenchymal Transition", "Angiogenesis & Invasion", "WikiPathways",
+  "REACTOME_SIGNALING_BY_TGFB_FAMILY_MEMBERS",                              "TGF-\u03b2 Signaling",              "Immune Evasion",           "Reactome",
+  "GOBP_MYELOID_CELL_HOMEOSTASIS",                                           "Myeloid Cell Homeostasis",           "Immune Evasion",           "GO-BP",
+  "GCCATNTTG_YY1_Q6",                                                        "YY1 Target Genes",                   "TF Network",               "TFT",
+  "SOX5_01",                                                                 "SOX5 Target Genes",                  "TF Network",               "TFT",
+  "GGGNNTTTCC_NFKB_Q6_01",                                                   "NF-\u03baB Target Genes",            "TF Network",               "TFT",
+  "STAT3_02",                                                                "STAT3 Target Genes",                 "TF Network",               "TFT"
+)
+
+# ── 3. Join curated list with actual ORA values ───────────────────────────────
+plot_df <- curated %>%
+  left_join(
+    all_ora %>% select(Description, FoldEnrichment, p.adjust, Count, GeneRatio),
+    by = "Description"
+  ) %>%
+  # Parse GeneRatio string (e.g. "52/923") to numeric
+  mutate(
+    GeneRatio_num = map_dbl(GeneRatio, ~ {
+      parts <- str_split(.x, "/")[[1]]
+      as.numeric(parts[1]) / as.numeric(parts[2])
+    }),
+    neg_log10_padj = -log10(p.adjust)
+  )
+
+# Verify all 18 terms were matched
+if (any(is.na(plot_df$FoldEnrichment))) {
+  warning("Some terms not matched — check Description strings:")
+  print(plot_df %>% filter(is.na(FoldEnrichment)) %>% select(Description, Display_Label))
+}
+
+# ── 4. Set factor levels for correct ordering ─────────────────────────────────
+
+# Theme order (top → bottom in plot)
+theme_order <- c(
+  "Epigenetic Reprogramming",
+  "miRNA Feedback Loop",
+  "Oncogenic Signaling",
+  "Stress Resistance",
+  "Cell Survival",
+  "Angiogenesis & Invasion",
+  "Immune Evasion",
+  "TF Network"
+)
+
+# Within each theme: order terms by FoldEnrichment (highest at top of group)
+plot_df <- plot_df %>%
+  mutate(Theme = factor(Theme, levels = rev(theme_order))) %>%
+  group_by(Theme) %>%
+  arrange(Theme, FoldEnrichment) %>%
+  ungroup() %>%
+  mutate(Display_Label = factor(Display_Label, levels = unique(Display_Label)))
+
+# ── 5. Colour palette ─────────────────────────────────────────────────────────
+
+# Strip background colours for each theme
+theme_colours <- c(
+  "Epigenetic Reprogramming" = "#7B4F9E",
+  "miRNA Feedback Loop"      = "#C975B0",
+  "Oncogenic Signaling"      = "#D62728",
+  "Stress Resistance"        = "#FF7F0E",
+  "Cell Survival"            = "#8B8B00",
+  "Angiogenesis & Invasion"  = "#17BECF",
+  "Immune Evasion"           = "#2CA02C",
+  "TF Network"               = "#1F77B4"
+)
+
+# FDR colour ramp: light yellow → orange → dark red
+fdr_colours <- c("#FFF5B0", "#FDB462", "#E31A1C")
+
+# ── 6. Build the dot plot ─────────────────────────────────────────────────────
+p <- ggplot(plot_df, aes(x = FoldEnrichment, y = Display_Label)) +
+
+  # Reference line at FE = 1
+  geom_vline(xintercept = 1.0,
+             linetype   = "dashed",
+             colour     = "grey55",
+             linewidth  = 0.5) +
+
+  # Dots: size = gene count, colour = -log10(FDR)
+  geom_point(aes(size  = Count,
+                 colour = neg_log10_padj),
+             alpha = 0.92) +
+
+  # DB source label to the right of each dot
+  geom_text(aes(x     = max(plot_df$FoldEnrichment, na.rm = TRUE) + 0.18,
+                label = DB_label),
+            hjust  = 0,
+            size   = 2.8,
+            colour = "grey45",
+            fontface = "italic") +
+
+  # Facet by Theme (free y so each group only shows its own terms)
+  facet_grid(Theme ~ .,
+             scales = "free_y",
+             space  = "free_y",
+             switch = "y") +          # strip on LEFT side
+
+  # Colour scale for FDR
+  scale_colour_gradientn(
+    colours = fdr_colours,
+    name    = expression(-log[10](FDR)),
+    guide   = guide_colorbar(
+      title.position = "top",
+      barwidth       = unit(5, "cm"),
+      barheight      = unit(0.4, "cm"),
+      frame.colour   = "grey50"
+    )
+  ) +
+
+  # Size scale for gene count
+  scale_size_continuous(
+    name   = "Gene count",
+    range  = c(3, 10),
+    breaks = c(18, 25, 40, 61, 93),
+    guide  = guide_legend(
+      title.position = "top",
+      override.aes   = list(colour = "grey40")
+    )
+  ) +
+
+  # X axis
+  scale_x_continuous(
+    name   = "Fold Enrichment",
+    limits = c(1.0, max(plot_df$FoldEnrichment, na.rm = TRUE) + 0.9),
+    breaks = pretty_breaks(n = 5),
+    expand = expansion(mult = c(0.01, 0.02))
+  ) +
+
+  # Y axis label
+  scale_y_discrete(name = NULL) +
+
+  # Labels
+  labs(
+    title    = "ORA \u2014 miR-509-3p / miR-377-3p / miR-378h Target Genes",
+    subtitle = "18 representative terms across 8 biological themes"
+  ) +
+
+  # Base theme
+  theme_bw(base_size = 11) +
+  theme(
+    # Title
+    plot.title         = element_text(face = "bold", size = 12, hjust = 0),
+    plot.subtitle      = element_text(size = 9.5, colour = "grey35", hjust = 0,
+                                       margin = margin(b = 8)),
+
+    # Facet strips (LEFT side, coloured by theme)
+    strip.placement    = "outside",
+    strip.background   = element_rect(fill = "grey92", colour = "grey70"),
+    strip.text.y.left  = element_text(angle = 0, hjust = 1, vjust = 0.5,
+                                       size = 8.5, face = "bold",
+                                       colour = "white",
+                                       margin = margin(l = 4, r = 4)),
+
+    # Panel
+    panel.border       = element_rect(colour = "grey75", fill = NA),
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_line(colour = "grey88", linetype = "dotted"),
+    panel.grid.minor.x = element_line(colour = "grey93", linetype = "dotted"),
+    panel.spacing      = unit(0.25, "lines"),
+
+    # Axis
+    axis.text.y        = element_text(size = 9.5, colour = "black"),
+    axis.text.x        = element_text(size = 9),
+    axis.title.x       = element_text(size = 10, margin = margin(t = 6)),
+
+    # Legend
+    legend.position    = "bottom",
+    legend.box         = "horizontal",
+    legend.title       = element_text(size = 9, face = "bold"),
+    legend.text        = element_text(size = 8.5),
+    legend.margin      = margin(t = 4),
+    legend.box.margin  = margin(t = 2),
+
+    # Extra right margin to fit DB labels
+    plot.margin        = margin(t = 8, r = 60, b = 8, l = 8)
+  ) +
+
+  # Allow geom_text labels to extend beyond panel boundary
+  coord_cartesian(clip = "off")
+
+# ── 7. Apply theme-specific strip colours ─────────────────────────────────────
+# ggplot2 does not natively support per-facet strip colours in facet_grid.
+# We use a grob-level hack after building the plot.
+# Alternative: use ggh4x::facet_grid2() if available.
+
+apply_strip_colours <- function(gg_plot, theme_col_map) {
+  library(grid)
+  gt  <- ggplotGrob(gg_plot)
+  # Find strip grobs on the left (y strips from facet_grid with switch="y")
+  strip_idx <- which(grepl("strip-l", gt$layout$name))
+  # Theme order in the grob (bottom to top because facet levels are reversed)
+  themes_in_plot <- rev(levels(plot_df$Theme))
+  for (i in seq_along(strip_idx)) {
+    theme_name <- themes_in_plot[i]
+    if (!is.null(theme_col_map[[theme_name]])) {
+      strip_grob <- gt$grobs[[strip_idx[i]]]
+      # Set the background rectangle colour
+      strip_grob$grobs[[1]]$children[[1]]$gp$fill <- theme_col_map[[theme_name]]
+      # Set the text colour to white
+      strip_grob$grobs[[1]]$children[[2]]$gp$col  <- "white"
+      gt$grobs[[strip_idx[i]]] <- strip_grob
+    }
+  }
+  return(gt)
+}
+
+# ── 8. Save output ────────────────────────────────────────────────────────────
+# Save plain ggplot first (works without grob manipulation if ggh4x absent)
+ggsave("ORA_dotplot_main.pdf",
+       plot   = p,
+       width  = 8,
+       height = 10,
+       units  = "in",
+       device = cairo_pdf)
+
+ggsave("ORA_dotplot_main.png",
+       plot   = p,
+       width  = 8,
+       height = 10,
+       units  = "in",
+       dpi    = 300,
+       bg     = "white")
+
+# Then attempt to apply per-strip colours and save a coloured version
+tryCatch({
+  gt_coloured <- apply_strip_colours(p, theme_colours)
+
+  pdf("ORA_dotplot_main_coloured.pdf", width = 8, height = 10)
+  grid::grid.draw(gt_coloured)
+  dev.off()
+
+  png("ORA_dotplot_main_coloured.png",
+      width  = 8,  height = 10,
+      units  = "in", res = 300, bg = "white")
+  grid::grid.draw(gt_coloured)
+  dev.off()
+
+  message("Coloured strip version saved successfully.")
+}, error = function(e) {
+  message("Strip colour grob edit failed — plain version already saved.")
+  message("To get per-facet strip colours, install ggh4x and use facet_grid2().")
+  message("Error: ", conditionMessage(e))
+})
+
+message("Done. Output files:")
+message("  ORA_dotplot_main.pdf / .png         — base version")
+message("  ORA_dotplot_main_coloured.pdf / .png — with theme strip colours")
+
+# ── 9. Optional: ggh4x version (cleaner strip colours) ───────────────────────
+# Uncomment this block if you have ggh4x installed:
+#
+# library(ggh4x)
+#
+# strip_designs <- strip_themed(
+#   background_y = elem_list_rect(
+#     fill = unname(theme_colours[theme_order])
+#   ),
+#   text_y = elem_list_text(colour = "white", face = "bold", angle = 0)
+# )
+#
+# p_ggh4x <- p +
+#   facet_grid2(Theme ~ .,
+#               scales  = "free_y",
+#               space   = "free_y",
+#               switch  = "y",
+#               strip   = strip_designs)
+#
+# ggsave("ORA_dotplot_ggh4x.pdf", p_ggh4x, width=8, height=10, device=cairo_pdf)
+# ggsave("ORA_dotplot_ggh4x.png", p_ggh4x, width=8, height=10, dpi=300, bg="white")
+```
+
+
+#plot top 50 of each them
+```{r}
+# =============================================================================
+# ORA 4-Panel Dot Plot — miR-509-3p / miR-377-3p / miR-378h
+# Separate panels for GO, Canonical Pathways, Hallmark, and TFT
+# Publication-quality figure for main or supplementary manuscript
+#
+# Input files (place in same directory as this script):
+#   all_go_ORA.csv        GO terms (BP + MF + CC combined)
+#   all_cp.csv            Canonical pathways (KEGG, Reactome, WikiPathways, PID)
+#   hallmark_ORA.csv      MSigDB Hallmark gene sets
+#   all_tft.csv           Transcription factor target gene sets
+#
+# Outputs:
+#   ORA_4panel_dotplot.pdf    (vector, 20 x 28 in combined)
+#   ORA_4panel_dotplot.png    (300 dpi)
+#   ORA_GO_panel.pdf          Individual GO panel
+#   ORA_CP_panel.pdf          Individual CP panel
+#   ORA_TFT_panel.pdf         Individual TFT panel
+#   ORA_Hallmark_panel.pdf    Individual Hallmark panel
+# =============================================================================
+
+# ── 0. Packages ───────────────────────────────────────────────────────────────
+library(tidyverse)
+library(scales)
+library(patchwork)   # combine panels: install.packages("patchwork")
+library(ggtext)      # rich text labels: install.packages("ggtext")
+
+# ── 1. Load data ──────────────────────────────────────────────────────────────
+go_df       <- read_csv("all_go_ORA.csv",   show_col_types = FALSE) %>% mutate(DB = "GO")
+cp_df       <- read_csv("all_cp.csv",        show_col_types = FALSE) %>% mutate(DB = "CP")
+hallmark_df <- read_csv("hallmark_ORA.csv",  show_col_types = FALSE) %>% mutate(DB = "Hallmark")
+tft_df      <- read_csv("all_tft.csv",       show_col_types = FALSE) %>% mutate(DB = "TFT")
+
+# ── 2. Parse GeneRatio to numeric ─────────────────────────────────────────────
+parse_ratio <- function(df) {
+  df %>%
+    mutate(
+      GeneRatio_num = map_dbl(GeneRatio, ~ {
+        x <- str_split(.x, "/")[[1]]
+        as.numeric(x[1]) / as.numeric(x[2])
+      }),
+      neg_log10_padj = -log10(p.adjust)
+    )
+}
+
+go_df       <- parse_ratio(go_df)
+cp_df       <- parse_ratio(cp_df)
+hallmark_df <- parse_ratio(hallmark_df)
+tft_df      <- parse_ratio(tft_df)
+
+# ── 3. Theme assignments ───────────────────────────────────────────────────────
+# Each term is assigned to a biological theme.
+# Terms NOT assigned here will be labelled "Other" and excluded from panels.
+
+go_themes <- c(
+  # Epigenetic Reprogramming
+  GOBP_CHROMATIN_ORGANIZATION                                         = "Epigenetic Reprogramming",
+  GOBP_CHROMATIN_REMODELING                                           = "Epigenetic Reprogramming",
+  GOMF_CHROMATIN_BINDING                                              = "Epigenetic Reprogramming",
+  GOMF_HISTONE_MODIFYING_ACTIVITY                                     = "Epigenetic Reprogramming",
+  GOBP_EPIGENETIC_REGULATION_OF_GENE_EXPRESSION                       = "Epigenetic Reprogramming",
+  GOCC_TRANSCRIPTION_REGULATOR_COMPLEX                                = "Epigenetic Reprogramming",
+  # Transcription & Gene Regulation
+  GOMF_TRANSCRIPTION_FACTOR_BINDING                                   = "Transcription Regulation",
+  GOMF_DNA_BINDING_TRANSCRIPTION_FACTOR_BINDING                       = "Transcription Regulation",
+  GOMF_RNA_POLYMERASE_II_SPECIFIC_DNA_BINDING_TRANSCRIPTION_FACTOR_BINDI = "Transcription Regulation",
+  GOMF_TRANSCRIPTION_COREGULATOR_ACTIVITY                             = "Transcription Regulation",
+  GOCC_NUCLEAR_BODY                                                   = "Transcription Regulation",
+  # miRNA Biology
+  GOBP_MIRNA_METABOLIC_PROCESS                                        = "miRNA Biology",
+  GOBP_MIRNA_TRANSCRIPTION                                            = "miRNA Biology",
+  GOBP_REGULATION_OF_MIRNA_METABOLIC_PROCESS                         = "miRNA Biology",
+  # Angiogenesis & Invasion
+  GOBP_VASCULATURE_DEVELOPMENT                                        = "Angiogenesis & Invasion",
+  GOBP_TUBE_MORPHOGENESIS                                             = "Angiogenesis & Invasion",
+  GOBP_BLOOD_VESSEL_MORPHOGENESIS                                     = "Angiogenesis & Invasion",
+  GOBP_REGULATION_OF_CELL_PROJECTION_ORGANIZATION                    = "Angiogenesis & Invasion",
+  GOBP_POSITIVE_REGULATION_OF_CELL_PROJECTION_ORGANIZATION           = "Angiogenesis & Invasion",
+  GOBP_CELL_JUNCTION_ORGANIZATION                                     = "Angiogenesis & Invasion",
+  GOBP_CELL_PROJECTION_MORPHOGENESIS                                  = "Angiogenesis & Invasion",
+  GOBP_REGULATION_OF_ANATOMICAL_STRUCTURE_MORPHOGENESIS              = "Angiogenesis & Invasion",
+  # Growth & Proliferation
+  GOBP_RESPONSE_TO_GROWTH_FACTOR                                      = "Growth & Proliferation",
+  GOBP_REGULATION_OF_GROWTH                                           = "Growth & Proliferation",
+  GOBP_REGULATION_OF_ORGAN_GROWTH                                     = "Growth & Proliferation",
+  GOBP_DEVELOPMENTAL_GROWTH                                           = "Growth & Proliferation",
+  GOBP_REGULATION_OF_DEVELOPMENTAL_GROWTH                            = "Growth & Proliferation",
+  GOBP_GROWTH                                                         = "Growth & Proliferation",
+  GOBP_HOMEOSTASIS_OF_NUMBER_OF_CELLS                                 = "Growth & Proliferation",
+  GOBP_REGULATION_OF_NEURON_PROJECTION_DEVELOPMENT                   = "Growth & Proliferation",
+  # DNA Damage & Stress
+  GOBP_DNA_DAMAGE_RESPONSE                                            = "DNA Damage & Stress Response",
+  GOBP_RESPONSE_TO_OXIDATIVE_STRESS                                   = "DNA Damage & Stress Response",
+  GOBP_CELLULAR_RESPONSE_TO_HORMONE_STIMULUS                         = "DNA Damage & Stress Response",
+  GOBP_RESPONSE_TO_HORMONE                                            = "DNA Damage & Stress Response",
+  # Protein Trafficking
+  GOBP_ORGANELLE_LOCALIZATION                                         = "Protein Trafficking",
+  GOBP_ESTABLISHMENT_OF_ORGANELLE_LOCALIZATION                       = "Protein Trafficking",
+  GOBP_MEMBRANE_ORGANIZATION                                         = "Protein Trafficking",
+  GOBP_REGULATION_OF_PROTEIN_LOCALIZATION                            = "Protein Trafficking",
+  GOBP_PROTEIN_LOCALIZATION_TO_ORGANELLE                             = "Protein Trafficking",
+  # Circadian
+  GOBP_RHYTHMIC_PROCESS                                               = "Circadian Rhythm",
+  GOBP_CIRCADIAN_RHYTHM                                               = "Circadian Rhythm",
+  # Kinase
+  GOMF_PROTEIN_KINASE_ACTIVITY                                        = "Kinase Signaling",
+  GOMF_RIBONUCLEOPROTEIN_COMPLEX_BINDING                             = "Kinase Signaling",
+  # Immune
+  GOBP_MYELOID_CELL_HOMEOSTASIS                                       = "Immune & Inflammation",
+  GOBP_MYELOID_CELL_DIFFERENTIATION                                   = "Immune & Inflammation",
+  GOBP_IMMUNE_SYSTEM_DEVELOPMENT                                     = "Immune & Inflammation",
+  # EMT
+  GOBP_EPITHELIAL_TO_MESENCHYMAL_TRANSITION                          = "EMT",
+  GOBP_REGULATION_OF_EPITHELIAL_TO_MESENCHYMAL_TRANSITION            = "EMT"
+)
+
+cp_themes <- c(
+  # Oncogenic Signaling
+  REACTOME_SIGNALING_BY_RECEPTOR_TYROSINE_KINASES                    = "Oncogenic Signaling",
+  REACTOME_DISEASES_OF_SIGNAL_TRANSDUCTION_BY_GROWTH_FACTOR_RECEPTORS_AN = "Oncogenic Signaling",
+  KEGG_PATHWAYS_IN_CANCER                                            = "Oncogenic Signaling",
+  REACTOME_INTRACELLULAR_SIGNALING_BY_SECOND_MESSENGERS              = "Oncogenic Signaling",
+  REACTOME_PTEN_REGULATION                                           = "Oncogenic Signaling",
+  REACTOME_REGULATION_OF_TP53_ACTIVITY                               = "Oncogenic Signaling",
+  WP_CANCER_PATHWAYS                                                 = "Oncogenic Signaling",
+  WP_HALLMARK_OF_CANCER_SUSTAINING_PROLIFERATIVE_SIGNALING           = "Oncogenic Signaling",
+  KEGG_CHRONIC_MYELOID_LEUKEMIA                                      = "Oncogenic Signaling",
+  KEGG_ENDOMETRIAL_CANCER                                            = "Oncogenic Signaling",
+  REACTOME_SIGNALING_BY_ALK_IN_CANCER                                = "Oncogenic Signaling",
+  REACTOME_CELLULAR_RESPONSES_TO_STIMULI                             = "Oncogenic Signaling",
+  WP_PLEURAL_MESOTHELIOMA                                            = "Oncogenic Signaling",
+  REACTOME_SIGNALING_BY_PTK6                                         = "Oncogenic Signaling",
+  WP_EGFEGFR_SIGNALING                                               = "Oncogenic Signaling",
+  REACTOME_SIGNALING_BY_NTRKS                                        = "Oncogenic Signaling",
+  KEGG_SMALL_CELL_LUNG_CANCER                                        = "Oncogenic Signaling",
+  WP_HEAD_AND_NECK_SQUAMOUS_CELL_CARCINOMA                           = "Oncogenic Signaling",
+  WP_GASTRIN_SIGNALING                                               = "Oncogenic Signaling",
+  WP_ENDOMETRIAL_CANCER                                              = "Oncogenic Signaling",
+  WP_HEPATITIS_C_AND_HEPATOCELLULAR_CARCINOMA                        = "Oncogenic Signaling",
+  KEGG_RENAL_CELL_CARCINOMA                                          = "Oncogenic Signaling",
+  WP_PATHWAYS_AFFECTED_IN_ADENOID_CYSTIC_CARCINOMA                   = "Oncogenic Signaling",
+  # Angiogenesis & Invasion
+  WP_VEGFAVEGFR2_SIGNALING                                           = "Angiogenesis & Invasion",
+  WP_EPITHELIAL_TO_MESENCHYMAL_TRANSITION_IN_COLORECTAL_CANCER       = "Angiogenesis & Invasion",
+  WP_FOCAL_ADHESION                                                  = "Angiogenesis & Invasion",
+  REACTOME_RHOD_GTPASE_CYCLE                                         = "Angiogenesis & Invasion",
+  WP_MICROTUBULE_CYTOSKELETON_REGULATION                             = "Angiogenesis & Invasion",
+  # Therapy Resistance
+  WP_EGFR_TYROSINE_KINASE_INHIBITOR_RESISTANCE                       = "Therapy Resistance",
+  REACTOME_KEAP1_NFE2L2_PATHWAY                                      = "Therapy Resistance",
+  REACTOME_NUCLEAR_EVENTS_MEDIATED_BY_NFE2L2                         = "Therapy Resistance",
+  REACTOME_CELLULAR_RESPONSE_TO_CHEMICAL_STRESS                      = "Therapy Resistance",
+  # TF Pathways
+  PID_AP1_PATHWAY                                                    = "TF-Driven Pathways",
+  PID_NFAT_3PATHWAY                                                  = "TF-Driven Pathways",
+  REACTOME_TRANSCRIPTIONAL_REGULATION_BY_RUNX3                       = "TF-Driven Pathways",
+  # Immune Evasion
+  WP_ONCOSTATIN_M_SIGNALING                                          = "Immune Evasion",
+  WP_MIRTARGETED_GENES_IN_LYMPHOCYTES                                = "Immune Evasion",
+  WP_VITAMIN_D_IN_INFLAMMATORY_DISEASES                              = "Immune Evasion",
+  REACTOME_INTERLEUKIN_4_AND_INTERLEUKIN_13_SIGNALING                = "Immune Evasion",
+  REACTOME_SIGNALING_BY_TGFB_FAMILY_MEMBERS                          = "Immune Evasion",
+  # DNA Damage
+  WP_DNA_DAMAGE_RESPONSE_ONLY_ATM_DEPENDENT                          = "DNA Damage & Stress Response",
+  REACTOME_S_PHASE                                                   = "DNA Damage & Stress Response",
+  # Metabolic
+  WP_STEROL_REGULATORY_ELEMENTBINDING_PROTEINS_SREBP_SIGNALING       = "Metabolic Reprogramming",
+  REACTOME_REGULATION_OF_CHOLESTEROL_BIOSYNTHESIS_BY_SREBP_SREBF      = "Metabolic Reprogramming",
+  # miRNA
+  WP_MIRTARGETED_GENES_IN_MUSCLE_CELL                                = "miRNA Biology"
+)
+
+hallmark_themes <- c(
+  HALLMARK_PROTEIN_SECRETION  = "Protein Secretion & EV Biology",
+  HALLMARK_APOPTOSIS          = "Cell Survival",
+  HALLMARK_UV_RESPONSE_DN     = "DNA Damage & Stress Response"
+)
+
+tft_themes <- c(
+  # YY1 / Epigenetic
+  GCCATNTTG_YY1_Q6            = "Epigenetic Masters (YY1)",
+  YY1_02                       = "Epigenetic Masters (YY1)",
+  # SOX / EMT
+  SOX5_01                      = "SOX / EMT Factors",
+  CATTGTYY_SOX9_B1             = "SOX / EMT Factors",
+  SOX9_B1                      = "SOX / EMT Factors",
+  SOX3_TARGET_GENES            = "SOX / EMT Factors",
+  HFH8_01                      = "SOX / EMT Factors",
+  # MYC / MYB / E2F — Proliferation
+  CMYB_01                      = "Proliferation (MYC/MYB/E2F)",
+  MYCMAX_02                    = "Proliferation (MYC/MYB/E2F)",
+  MAX_01                       = "Proliferation (MYC/MYB/E2F)",
+  E2F1_Q3_01                   = "Proliferation (MYC/MYB/E2F)",
+  E2F_Q4_01                    = "Proliferation (MYC/MYB/E2F)",
+  GCANCTGNY_MYOD_Q6            = "Proliferation (MYC/MYB/E2F)",
+  GTGACGY_E4F1_Q6              = "Proliferation (MYC/MYB/E2F)",
+  CETS1P54_01                  = "Proliferation (MYC/MYB/E2F)",
+  USF_Q6_01                    = "Proliferation (MYC/MYB/E2F)",
+  # NF-kB / AP1 / CREB / Stress-Immune
+  GGGNNTTTCC_NFKB_Q6_01        = "Stress & Immune (NF-\u03baB/AP1/CREB)",
+  AP2ALPHA_01                  = "Stress & Immune (NF-\u03baB/AP1/CREB)",
+  CREB_Q3                      = "Stress & Immune (NF-\u03baB/AP1/CREB)",
+  TCF11_01                     = "Stress & Immune (NF-\u03baB/AP1/CREB)",
+  RGAANNTTC_HSF1_01            = "Stress & Immune (NF-\u03baB/AP1/CREB)",
+  RCGCANGCGY_NRF1_Q6           = "Stress & Immune (NF-\u03baB/AP1/CREB)",
+  CACBINDINGPROTEIN_Q6         = "Stress & Immune (NF-\u03baB/AP1/CREB)",
+  RGAGGAARY_PU1_Q6             = "Stress & Immune (NF-\u03baB/AP1/CREB)",
+  # STAT
+  STAT3_02                     = "STAT / Cytokine Signaling",
+  # HIF / Hypoxia-Metabolism
+  HIF1_Q5                      = "Hypoxia & Metabolism (HIF/SREBP)",
+  SREBP1_Q6                    = "Hypoxia & Metabolism (HIF/SREBP)",
+  # Ras/MAPK
+  RREB1_01                     = "Ras/MAPK Response",
+  # Developmental / Stem Cell
+  GLI3_TARGET_GENES            = "Developmental / Stem Cell",
+  FOXG1_TARGET_GENES           = "Developmental / Stem Cell",
+  GGATTA_PITX2_Q2              = "Developmental / Stem Cell",
+  RTAAACA_FREAC2_01            = "Developmental / Stem Cell",
+  TGACAGNY_MEIS1_01            = "Developmental / Stem Cell",
+  TGCCAAR_NF1_Q6               = "Developmental / Stem Cell",
+  PAX4_01                      = "Developmental / Stem Cell",
+  TAATTA_CHX10_01              = "Developmental / Stem Cell",
+  AUTS2_TARGET_GENES           = "Developmental / Stem Cell",
+  FOXM1_01                     = "Developmental / Stem Cell"
+)
+
+# ── 4. Apply theme assignments and filter ─────────────────────────────────────
+assign_and_filter <- function(df, theme_vec, top_n = 50, padj_cut = 0.05) {
+  df %>%
+    filter(p.adjust < padj_cut) %>%
+    arrange(p.adjust) %>%
+    slice_head(n = top_n) %>%
+    mutate(Theme = theme_vec[Description]) %>%
+    filter(!is.na(Theme))   # remove unassigned terms
+}
+
+go_plot_df       <- assign_and_filter(go_df,       go_themes,       top_n = 50)
+cp_plot_df       <- assign_and_filter(cp_df,        cp_themes,       top_n = 50)
+hallmark_plot_df <- assign_and_filter(hallmark_df,  hallmark_themes, top_n = 50)
+tft_plot_df      <- assign_and_filter(tft_df,       tft_themes,      top_n = 50)
+
+cat("Terms retained per panel:\n")
+cat("  GO:      ", nrow(go_plot_df),       "\n")
+cat("  CP:      ", nrow(cp_plot_df),       "\n")
+cat("  Hallmark:", nrow(hallmark_plot_df), "\n")
+cat("  TFT:     ", nrow(tft_plot_df),      "\n")
+
+# ── 5. Clean up display labels ────────────────────────────────────────────────
+clean_label <- function(x) {
+  x %>%
+    str_remove("^(GOBP|GOMF|GOCC|KEGG|REACTOME|WP|PID|HALLMARK)_") %>%
+    str_replace_all("_", " ") %>%
+    str_to_title() %>%
+    str_trunc(55, ellipsis = "…")
+}
+
+add_display_label <- function(df) {
+  df %>% mutate(Display_Label = clean_label(Description))
+}
+
+go_plot_df       <- add_display_label(go_plot_df)
+cp_plot_df       <- add_display_label(cp_plot_df)
+hallmark_plot_df <- add_display_label(hallmark_plot_df)
+tft_plot_df      <- add_display_label(tft_plot_df)
+
+# For TFT: keep the raw motif/TF name as-is (already readable)
+tft_plot_df <- tft_plot_df %>%
+  mutate(Display_Label = Description %>%
+           str_replace_all("_TARGET_GENES", " targets") %>%
+           str_replace_all("_", " ") %>%
+           str_to_title() %>%
+           str_trunc(50, ellipsis = "…"))
+
+# ── 6. Set factor levels (within-theme by FoldEnrichment, themes by order) ───
+order_terms <- function(df, theme_order) {
+  df %>%
+    mutate(Theme = factor(Theme, levels = rev(theme_order))) %>%
+    group_by(Theme) %>%
+    arrange(Theme, FoldEnrichment) %>%
+    ungroup() %>%
+    mutate(Display_Label = factor(Display_Label, levels = unique(Display_Label)))
+}
+
+go_theme_order <- c(
+  "Epigenetic Reprogramming", "miRNA Biology", "Transcription Regulation",
+  "Growth & Proliferation", "Angiogenesis & Invasion", "EMT",
+  "DNA Damage & Stress Response", "Kinase Signaling",
+  "Protein Trafficking", "Circadian Rhythm", "Immune & Inflammation"
+)
+
+cp_theme_order <- c(
+  "Oncogenic Signaling", "Angiogenesis & Invasion", "TF-Driven Pathways",
+  "Therapy Resistance", "Immune Evasion",
+  "DNA Damage & Stress Response", "Metabolic Reprogramming", "miRNA Biology"
+)
+
+hallmark_theme_order <- c(
+  "Protein Secretion & EV Biology", "Cell Survival", "DNA Damage & Stress Response"
+)
+
+tft_theme_order <- c(
+  "Epigenetic Masters (YY1)", "SOX / EMT Factors",
+  "Proliferation (MYC/MYB/E2F)", "Stress & Immune (NF-\u03baB/AP1/CREB)",
+  "STAT / Cytokine Signaling", "Hypoxia & Metabolism (HIF/SREBP)",
+  "Ras/MAPK Response", "Developmental / Stem Cell"
+)
+
+go_plot_df       <- order_terms(go_plot_df,       go_theme_order)
+cp_plot_df       <- order_terms(cp_plot_df,        cp_theme_order)
+hallmark_plot_df <- order_terms(hallmark_plot_df,  hallmark_theme_order)
+tft_plot_df      <- order_terms(tft_plot_df,       tft_theme_order)
+
+# ── 7. Colour palettes ────────────────────────────────────────────────────────
+fdr_colours  <- c("#FFF5B0", "#FDB462", "#E31A1C")
+
+go_strip_cols <- c(
+  "Epigenetic Reprogramming" = "#7B4F9E",
+  "miRNA Biology"            = "#C975B0",
+  "Transcription Regulation" = "#9467BD",
+  "Growth & Proliferation"   = "#D62728",
+  "Angiogenesis & Invasion"  = "#17BECF",
+  "EMT"                      = "#1F77B4",
+  "DNA Damage & Stress Response" = "#FF7F0E",
+  "Kinase Signaling"         = "#E377C2",
+  "Protein Trafficking"      = "#8C564B",
+  "Circadian Rhythm"         = "#BCBD22",
+  "Immune & Inflammation"    = "#2CA02C"
+)
+
+cp_strip_cols <- c(
+  "Oncogenic Signaling"          = "#D62728",
+  "Angiogenesis & Invasion"      = "#17BECF",
+  "TF-Driven Pathways"           = "#9467BD",
+  "Therapy Resistance"           = "#FF7F0E",
+  "Immune Evasion"               = "#2CA02C",
+  "DNA Damage & Stress Response" = "#8C564B",
+  "Metabolic Reprogramming"      = "#BCBD22",
+  "miRNA Biology"                = "#C975B0"
+)
+
+hallmark_strip_cols <- c(
+  "Protein Secretion & EV Biology" = "#7B4F9E",
+  "Cell Survival"                  = "#D62728",
+  "DNA Damage & Stress Response"   = "#FF7F0E"
+)
+
+tft_strip_cols <- c(
+  "Epigenetic Masters (YY1)"                = "#7B4F9E",
+  "SOX / EMT Factors"                       = "#1F77B4",
+  "Proliferation (MYC/MYB/E2F)"            = "#D62728",
+  "Stress & Immune (NF-\u03baB/AP1/CREB)"  = "#2CA02C",
+  "STAT / Cytokine Signaling"               = "#17BECF",
+  "Hypoxia & Metabolism (HIF/SREBP)"        = "#FF7F0E",
+  "Ras/MAPK Response"                       = "#E377C2",
+  "Developmental / Stem Cell"               = "#8C564B"
+)
+
+# ── 8. Core plotting function ─────────────────────────────────────────────────
+make_dotplot <- function(df, title_label, strip_col_map,
+                         x_max = NULL, x_breaks = NULL) {
+
+  if (is.null(x_max))    x_max    <- max(df$FoldEnrichment, na.rm = TRUE) * 1.05
+  if (is.null(x_breaks)) x_breaks <- pretty_breaks(n = 4)
+
+  n_terms  <- nrow(df)
+  dot_max  <- max(df$Count, na.rm = TRUE)
+  dot_min  <- min(df$Count, na.rm = TRUE)
+  fdr_max  <- max(df$neg_log10_padj, na.rm = TRUE)
+
+  p <- ggplot(df, aes(x = FoldEnrichment, y = Display_Label)) +
+
+    # Reference line
+    geom_vline(xintercept = 1.0, linetype = "dashed",
+               colour = "grey55", linewidth = 0.45) +
+
+    # Dots
+    geom_point(aes(size = Count, colour = neg_log10_padj),
+               alpha = 0.90) +
+
+    # Facet
+    facet_grid(Theme ~ ., scales = "free_y", space = "free_y", switch = "y") +
+
+    # Colour: FDR
+    scale_colour_gradientn(
+      colours  = fdr_colours,
+      name     = expression(-log[10](FDR)),
+      limits   = c(0, fdr_max),
+      guide    = guide_colorbar(
+        title.position = "top",
+        barwidth  = unit(4.5, "cm"),
+        barheight = unit(0.4, "cm"),
+        frame.colour = "grey50"
+      )
+    ) +
+
+    # Size: gene count
+    scale_size_continuous(
+      name  = "Gene count",
+      range = c(2.5, 9),
+      guide = guide_legend(
+        title.position = "top",
+        override.aes   = list(colour = "grey40"),
+        nrow = 1
+      )
+    ) +
+
+    # X axis
+    scale_x_continuous(
+      name   = "Fold Enrichment",
+      limits = c(0.9, x_max),
+      breaks = x_breaks,
+      expand = expansion(mult = c(0.01, 0.05))
+    ) +
+
+    scale_y_discrete(name = NULL) +
+
+    labs(title = title_label) +
+
+    theme_bw(base_size = 10.5) +
+    theme(
+      plot.title         = element_text(face = "bold", size = 12,
+                                         margin = margin(b = 4)),
+      strip.placement    = "outside",
+      strip.background   = element_rect(fill = "grey30", colour = NA),
+      strip.text.y.left  = element_text(angle = 0, hjust = 1, size = 8,
+                                         face = "bold", colour = "white",
+                                         margin = margin(l = 3, r = 3)),
+      panel.border       = element_rect(colour = "grey70", fill = NA,
+                                         linewidth = 0.5),
+      panel.grid.major.y = element_blank(),
+      panel.grid.major.x = element_line(colour = "grey88", linetype = "dotted",
+                                         linewidth = 0.4),
+      panel.grid.minor.x = element_blank(),
+      panel.spacing      = unit(0.2, "lines"),
+      axis.text.y        = element_text(size = 8.5, colour = "black"),
+      axis.text.x        = element_text(size = 8),
+      axis.title.x       = element_text(size = 9.5, margin = margin(t = 5)),
+      legend.position    = "bottom",
+      legend.box         = "horizontal",
+      legend.title       = element_text(size = 8.5, face = "bold"),
+      legend.text        = element_text(size = 8),
+      legend.margin      = margin(t = 2),
+      plot.margin        = margin(t = 6, r = 10, b = 4, l = 4)
+    ) +
+    coord_cartesian(clip = "off")
+
+  return(p)
+}
+
+# ── 9. Build all 4 panels ─────────────────────────────────────────────────────
+p_go <- make_dotplot(go_plot_df,       
+                     "Gene Ontology (BP + MF + CC)",  
+                     go_strip_cols)
+
+p_cp <- make_dotplot(cp_plot_df,       
+                     "Canonical Pathways (KEGG / Reactome / WikiPathways / PID)",  
+                     cp_strip_cols)
+
+p_hallmark <- make_dotplot(hallmark_plot_df,  
+                           "MSigDB Hallmark Gene Sets",  
+                           hallmark_strip_cols)
+
+p_tft <- make_dotplot(tft_plot_df,     
+                      "Transcription Factor Targets (TFT)",  
+                      tft_strip_cols)
+
+# ── 10. Apply per-strip colours via grob editing ─────────────────────────────
+apply_strip_colours <- function(p, strip_col_map) {
+  library(grid)
+  gt         <- ggplotGrob(p)
+  strip_idx  <- which(grepl("^strip-l", gt$layout$name))
+  # theme levels run bottom→top in grob order, but factor levels are reversed
+  # so we need to map carefully
+  theme_levels <- levels(p$data$Theme)  # already reversed (bottom=1)
+
+  for (i in seq_along(strip_idx)) {
+    # grob strips go top→bottom on page, so index from end
+    theme_name <- theme_levels[length(theme_levels) - i + 1]
+    col <- strip_col_map[[theme_name]]
+    if (!is.null(col)) {
+      strip_grob <- gt$grobs[[strip_idx[i]]]
+      # background rect
+      strip_grob$grobs[[1]]$children[[1]]$gp$fill <- col
+      # text colour → white
+      strip_grob$grobs[[1]]$children[[2]]$gp$col  <- "white"
+      gt$grobs[[strip_idx[i]]] <- strip_grob
+    }
+  }
+  return(gt)
+}
+
+# ── 11. Save individual panels ────────────────────────────────────────────────
+save_panel <- function(p, strip_col_map, filename_base,
+                       w = 9, h_per_term = 0.28, h_min = 4) {
+
+  n     <- nrow(p$data)
+  h     <- max(h_min, n * h_per_term + 2.5)
+
+  # Plain version (always works)
+  ggsave(paste0(filename_base, ".pdf"), p,
+         width = w, height = h, units = "in", device = cairo_pdf)
+  ggsave(paste0(filename_base, ".png"), p,
+         width = w, height = h, units = "in", dpi = 300, bg = "white")
+
+  # Coloured strip version (grob hack)
+  tryCatch({
+    gt <- apply_strip_colours(p, strip_col_map)
+    pdf(paste0(filename_base, "_coloured.pdf"), width = w, height = h)
+    grid::grid.draw(gt); dev.off()
+    png(paste0(filename_base, "_coloured.png"),
+        width = w, height = h, units = "in", res = 300, bg = "white")
+    grid::grid.draw(gt); dev.off()
+    message("  Coloured strips saved: ", filename_base)
+  }, error = function(e) {
+    message("  Strip colour edit failed for ", filename_base, ": ", e$message)
+  })
+}
+
+message("Saving GO panel...")
+save_panel(p_go,       go_strip_cols,       "ORA_GO_panel")
+
+message("Saving CP panel...")
+save_panel(p_cp,       cp_strip_cols,       "ORA_CP_panel")
+
+message("Saving Hallmark panel...")
+save_panel(p_hallmark, hallmark_strip_cols, "ORA_Hallmark_panel", h_min = 3)
+
+message("Saving TFT panel...")
+save_panel(p_tft,      tft_strip_cols,      "ORA_TFT_panel")
+
+# ── 12. Combined 4-panel figure with patchwork ───────────────────────────────
+# GO + CP side by side (top row), TFT + Hallmark (bottom row)
+message("Saving combined 4-panel figure...")
+
+combined <- (p_go | p_cp) / (p_tft | p_hallmark) +
+  plot_annotation(
+    title    = "Over-Representation Analysis \u2014 miR-509-3p / miR-377-3p / miR-378h Target Genes",
+    subtitle = "Top terms grouped by biological theme across four gene set databases",
+    caption  = paste0("FDR < 0.05; top 50 terms shown per database after exclusion of",
+                      " off-target (neuronal/developmental) terms.\n",
+                      "Dot size = gene count. Colour = \u2212log\u2081\u2080(FDR)."),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 14, hjust = 0),
+      plot.subtitle = element_text(size = 10, colour = "grey30", hjust = 0),
+      plot.caption  = element_text(size = 8,  colour = "grey50", hjust = 0)
+    )
+  )
+
+ggsave("ORA_4panel_dotplot.pdf", combined,
+       width = 20, height = 28, units = "in", device = cairo_pdf)
+ggsave("ORA_4panel_dotplot.png", combined,
+       width = 20, height = 28, units = "in", dpi = 200, bg = "white")
+
+message("\nAll done! Files saved:")
+message("  ORA_GO_panel.pdf / .png / _coloured versions")
+message("  ORA_CP_panel.pdf / .png / _coloured versions")
+message("  ORA_TFT_panel.pdf / .png / _coloured versions")
+message("  ORA_Hallmark_panel.pdf / .png / _coloured versions")
+message("  ORA_4panel_dotplot.pdf / .png  (combined)")
+
+# ── 13. Optional: ggh4x for cleaner strip colours ────────────────────────────
+# If you install ggh4x, replace facet_grid() with facet_grid2() + strip_themed()
+# inside make_dotplot(). Example:
+#
+# library(ggh4x)
+# strip_designs <- strip_themed(
+#   background_y = elem_list_rect(fill = unname(strip_col_map[theme_order])),
+#   text_y       = elem_list_text(colour = "white", face = "bold", angle = 0)
+# )
+# ... replace facet_grid(...) with:
+# facet_grid2(Theme ~ ., scales="free_y", space="free_y",
+#             switch="y", strip=strip_designs)
+```
+
+
+#top30
+```{r}
+# =============================================================================
+# ORA Top-30 Dot Plot — 4 Separate Panels
+# miR-509-3p / miR-377-3p / miR-378h Target Genes
+#
+# Strategy:
+#   - Top 30 terms by FDR per database (top 3 for Hallmark — only 3 significant)
+#   - Biologically off-target terms excluded (neuronal, embryonic, EDMD)
+#   - Unknown TFT motifs (no TF name) excluded
+#   - Remaining terms grouped into biological themes
+#   - One dot plot per database, saved individually + combined 2x2
+#
+# Required input files (same folder as this script):
+#   all_go_ORA.csv  |  all_cp.csv  |  hallmark_ORA.csv  |  all_tft.csv
+#
+# Required packages:
+#   install.packages(c("tidyverse","scales","patchwork","ggtext"))
+#   install.packages("ggh4x")   # optional — cleaner strip colours
+# =============================================================================
+
+library(tidyverse)
+library(scales)
+library(patchwork)
+
+# ── 1. Load data ──────────────────────────────────────────────────────────────
+go_raw  <- read_csv("all_go_ORA.csv",   show_col_types = FALSE)
+cp_raw  <- read_csv("all_cp.csv",        show_col_types = FALSE)
+hl_raw  <- read_csv("hallmark_ORA.csv",  show_col_types = FALSE)
+tft_raw <- read_csv("all_tft.csv",       show_col_types = FALSE)
+
+# Helper: parse "52/923" → numeric ratio
+parse_ratio <- function(x) {
+  parts <- str_split(x, "/")[[1]]
+  as.numeric(parts[1]) / as.numeric(parts[2])
+}
+
+prep_df <- function(df, db_label) {
+  df %>%
+    mutate(
+      GeneRatio_num  = map_dbl(GeneRatio, parse_ratio),
+      neg_log10_padj = -log10(p.adjust),
+      DB             = db_label
+    )
+}
+
+go_df  <- prep_df(go_raw,  "GO")
+cp_df  <- prep_df(cp_raw,  "CP")
+hl_df  <- prep_df(hl_raw,  "Hallmark")
+tft_df <- prep_df(tft_raw, "TFT")
+
+# ── 2. Curated term tables ────────────────────────────────────────────────────
+# Each table: Description (exact), Display_Label, Theme, DB_source
+# Terms are the top-30 by FDR with off-target / unknown terms removed.
+
+# ─── 2a. GO (25 terms from top 30; 5 off-target excluded) ────────────────────
+go_terms <- tribble(
+  ~Description,                                                                    ~Display_Label,                           ~Theme,
+  # Epigenetic Reprogramming (4)
+  "GOBP_CHROMATIN_ORGANIZATION",        "Chromatin Organization",                 "Epigenetic Reprogramming",
+  "GOBP_CHROMATIN_REMODELING",          "Chromatin Remodeling",                   "Epigenetic Reprogramming",
+  "GOMF_CHROMATIN_BINDING",             "Chromatin Binding",                      "Epigenetic Reprogramming",
+  "GOMF_HISTONE_MODIFYING_ACTIVITY",    "Histone Modifying Activity",             "Epigenetic Reprogramming",
+  # Transcription Regulation (4)
+  "GOCC_TRANSCRIPTION_REGULATOR_COMPLEX",                                          "Transcription Regulator Complex",        "Transcription Regulation",
+  "GOMF_TRANSCRIPTION_FACTOR_BINDING",                                             "Transcription Factor Binding",           "Transcription Regulation",
+  "GOMF_DNA_BINDING_TRANSCRIPTION_FACTOR_BINDING",                                 "DNA-binding TF Activity",                "Transcription Regulation",
+  "GOMF_RNA_POLYMERASE_II_SPECIFIC_DNA_BINDING_TRANSCRIPTION_FACTOR_BINDING",      "RNA Pol II TF Binding",                  "Transcription Regulation",
+  # miRNA Biology (3)
+  "GOBP_MIRNA_METABOLIC_PROCESS",       "miRNA Metabolic Process",                "miRNA Biology",
+  "GOBP_MIRNA_TRANSCRIPTION",           "miRNA Transcription",                    "miRNA Biology",
+  "GOBP_REGULATION_OF_MIRNA_METABOLIC_PROCESS", "Regulation of miRNA Metabolism", "miRNA Biology",
+  # Angiogenesis & Vascular Development (3)
+  "GOBP_VASCULATURE_DEVELOPMENT",       "Vasculature Development",                "Angiogenesis & Vascular Dev",
+  "GOBP_TUBE_MORPHOGENESIS",            "Tube Morphogenesis",                     "Angiogenesis & Vascular Dev",
+  "GOBP_BLOOD_VESSEL_MORPHOGENESIS",    "Blood Vessel Morphogenesis",             "Angiogenesis & Vascular Dev",
+  # Cell Motility & Morphology (2)
+  "GOBP_REGULATION_OF_CELL_PROJECTION_ORGANIZATION",    "Cell Projection Organization",    "Cell Motility & Morphology",
+  "GOBP_REGULATION_OF_ANATOMICAL_STRUCTURE_MORPHOGENESIS", "Anatomical Structure Morphogenesis", "Cell Motility & Morphology",
+  # Growth & Hormone Response (4)
+  "GOBP_RESPONSE_TO_HORMONE",           "Response to Hormone",                    "Growth & Hormone Response",
+  "GOBP_REGULATION_OF_GROWTH",          "Regulation of Growth",                   "Growth & Hormone Response",
+  "GOBP_REGULATION_OF_DEVELOPMENTAL_GROWTH", "Regulation of Developmental Growth","Growth & Hormone Response",
+  "GOBP_RESPONSE_TO_GROWTH_FACTOR",     "Response to Growth Factor",              "Growth & Hormone Response",
+  # Intracellular Trafficking (3)
+  "GOBP_ORGANELLE_LOCALIZATION",        "Organelle Localization",                 "Intracellular Trafficking",
+  "GOBP_MEMBRANE_ORGANIZATION",         "Membrane Organization",                  "Intracellular Trafficking",
+  "GOBP_ESTABLISHMENT_OF_ORGANELLE_LOCALIZATION", "Organelle Localization (Est.)", "Intracellular Trafficking",
+  # Circadian Rhythm (1)
+  "GOBP_RHYTHMIC_PROCESS",              "Rhythmic Process",                       "Circadian Rhythm",
+  # DNA Damage & Stress (1)
+  "GOBP_DNA_DAMAGE_RESPONSE",           "DNA Damage Response",                    "DNA Damage & Stress"
+)
+
+# ─── 2b. CP (26 terms from top 30; 4 off-target excluded) ────────────────────
+cp_terms <- tribble(
+  ~Description,                                                                    ~Display_Label,                           ~Theme,
+  # Oncogenic Signaling (9)
+  "REACTOME_SIGNALING_BY_RECEPTOR_TYROSINE_KINASES",
+    "RTK Signaling",                                                               "Oncogenic Signaling",
+  "REACTOME_DISEASES_OF_SIGNAL_TRANSDUCTION_BY_GROWTH_FACTOR_RECEPTORS_AND_SECOND_MESSENGERS",
+    "Diseases of Signal Transduction",                                             "Oncogenic Signaling",
+  "REACTOME_CELLULAR_RESPONSES_TO_STIMULI",
+    "Cellular Responses to Stimuli",                                               "Oncogenic Signaling",
+  "KEGG_PATHWAYS_IN_CANCER",
+    "Pathways in Cancer",                                                          "Oncogenic Signaling",
+  "REACTOME_INTRACELLULAR_SIGNALING_BY_SECOND_MESSENGERS",
+    "Intracellular Signaling (2nd Messengers)",                                    "Oncogenic Signaling",
+  "WP_CANCER_PATHWAYS",
+    "Cancer Pathways",                                                             "Oncogenic Signaling",
+  "REACTOME_PTEN_REGULATION",
+    "PTEN Regulation",                                                             "Oncogenic Signaling",
+  "WP_HALLMARK_OF_CANCER_SUSTAINING_PROLIFERATIVE_SIGNALING",
+    "Sustaining Proliferative Signaling",                                          "Oncogenic Signaling",
+  "REACTOME_SIGNALING_BY_PTK6",
+    "PTK6 Signaling",                                                              "Oncogenic Signaling",
+  # Angiogenesis & EMT (4)
+  "WP_VEGFAVEGFR2_SIGNALING",
+    "VEGFA\u2013VEGFR2 Signaling",                                                 "Angiogenesis & EMT",
+  "WP_EPITHELIAL_TO_MESENCHYMAL_TRANSITION_IN_COLORECTAL_CANCER",
+    "Epithelial\u2013Mesenchymal Transition",                                      "Angiogenesis & EMT",
+  "WP_FOCAL_ADHESION",
+    "Focal Adhesion",                                                              "Angiogenesis & EMT",
+  "REACTOME_RHOD_GTPASE_CYCLE",
+    "RhoD GTPase Cycle",                                                           "Angiogenesis & EMT",
+  # Cancer-Specific Pathways (4)
+  "WP_PLEURAL_MESOTHELIOMA",
+    "Pleural Mesothelioma",                                                        "Cancer-Specific Pathways",
+  "KEGG_RENAL_CELL_CARCINOMA",
+    "Renal Cell Carcinoma",                                                        "Cancer-Specific Pathways",
+  "KEGG_CHRONIC_MYELOID_LEUKEMIA",
+    "Chronic Myeloid Leukemia",                                                    "Cancer-Specific Pathways",
+  "KEGG_ENDOMETRIAL_CANCER",
+    "Endometrial Cancer",                                                          "Cancer-Specific Pathways",
+  # TF-Driven Pathways (3)
+  "PID_AP1_PATHWAY",
+    "AP1 Pathway",                                                                 "TF-Driven Pathways",
+  "REACTOME_TRANSCRIPTIONAL_REGULATION_BY_RUNX3",
+    "Transcriptional Regulation by RUNX3",                                         "TF-Driven Pathways",
+  "PID_NFAT_3PATHWAY",
+    "NFAT Pathway",                                                                "TF-Driven Pathways",
+  # Therapy Resistance (2)
+  "REACTOME_NUCLEAR_EVENTS_MEDIATED_BY_NFE2L2",
+    "NRF2 Nuclear Events",                                                         "Therapy Resistance",
+  "REACTOME_CELLULAR_RESPONSE_TO_CHEMICAL_STRESS",
+    "Cellular Response to Chemical Stress",                                        "Therapy Resistance",
+  # DNA Damage & Stress (1)
+  "WP_DNA_DAMAGE_RESPONSE_ONLY_ATM_DEPENDENT",
+    "DNA Damage Response (ATM)",                                                   "DNA Damage & Stress",
+  # Metabolic Reprogramming (1)
+  "WP_STEROL_REGULATORY_ELEMENTBINDING_PROTEINS_SREBP_SIGNALING",
+    "SREBP Signaling",                                                             "Metabolic Reprogramming",
+  # miRNA / Immune (2)
+  "WP_MIRTARGETED_GENES_IN_LYMPHOCYTES",
+    "miRNA-Targeted Genes in Lymphocytes",                                         "miRNA / Immune",
+  "WP_MIRTARGETED_GENES_IN_MUSCLE_CELL",
+    "miRNA-Targeted Genes in Muscle",                                              "miRNA / Immune"
+)
+
+# ─── 2c. Hallmark (3 significant terms only) ──────────────────────────────────
+hl_terms <- tribble(
+  ~Description,                  ~Display_Label,             ~Theme,
+  "HALLMARK_PROTEIN_SECRETION",  "Protein Secretion",        "Protein Secretion & EV Biology",
+  "HALLMARK_APOPTOSIS",          "Apoptosis",                "Cell Survival",
+  "HALLMARK_UV_RESPONSE_DN",     "UV Response (Down)",       "DNA Damage & Stress"
+)
+
+# ─── 2d. TFT (25 terms from top 30; 5 unknown motifs excluded) ───────────────
+tft_terms <- tribble(
+  ~Description,                  ~Display_Label,                    ~Theme,
+  # YY1 / Epigenetic Master (2)
+  "GCCATNTTG_YY1_Q6",            "YY1 (GCCATNTTG motif)",           "YY1 \u2014 Epigenetic Master",
+  "YY1_02",                      "YY1 (motif v2)",                   "YY1 \u2014 Epigenetic Master",
+  # SOX / EMT Factors (3)
+  "SOX5_01",                     "SOX5",                            "SOX / EMT Factors",
+  "CATTGTYY_SOX9_B1",            "SOX9",                            "SOX / EMT Factors",
+  "SOX3_TARGET_GENES",           "SOX3 Target Genes",               "SOX / EMT Factors",
+  # Proliferation — MYC/MYB/E2F (4)
+  "CMYB_01",                     "c-MYB",                           "Proliferation (MYC/MYB/E2F)",
+  "E2F1_Q3_01",                  "E2F1",                            "Proliferation (MYC/MYB/E2F)",
+  "GTGACGY_E4F1_Q6",             "E4F1",                            "Proliferation (MYC/MYB/E2F)",
+  "MYCMAX_02",                   "MYC\u2013MAX",                    "Proliferation (MYC/MYB/E2F)",
+  # Stress & Immune — HSF/NRF/CREB (4)
+  "RGAANNTTC_HSF1_01",           "HSF1 (Heat Shock)",               "Stress & Immune (HSF/NRF/CREB)",
+  "RCGCANGCGY_NRF1_Q6",          "NRF1",                            "Stress & Immune (HSF/NRF/CREB)",
+  "CREB_Q3",                     "CREB",                            "Stress & Immune (HSF/NRF/CREB)",
+  "AP2ALPHA_01",                 "AP2\u03b1",                       "Stress & Immune (HSF/NRF/CREB)",
+  # Hypoxia & Metabolism (1)
+  "HIF1_Q5",                     "HIF1 (Hypoxia)",                  "Hypoxia & Metabolism",
+  # Ras/MAPK Response (1)
+  "RREB1_01",                    "RREB1 (Ras/MAPK response)",       "Ras/MAPK Response",
+  # Developmental / Stem Cell (7)
+  "TGACAGNY_MEIS1_01",           "MEIS1",                           "Developmental / Stem Cell",
+  "RTAAACA_FREAC2_01",           "FREAC2 (FOXA)",                   "Developmental / Stem Cell",
+  "GGATTA_PITX2_Q2",             "PITX2",                           "Developmental / Stem Cell",
+  "GLI3_TARGET_GENES",           "GLI3 (Hedgehog)",                 "Developmental / Stem Cell",
+  "TGCCAAR_NF1_Q6",              "NF1",                             "Developmental / Stem Cell",
+  "PAX4_01",                     "PAX4",                            "Developmental / Stem Cell",
+  "TAATTA_CHX10_01",             "CHX10",                           "Developmental / Stem Cell",
+  # ZNF / Other Regulators (3)
+  "ZNF513_TARGET_GENES",         "ZNF513 Target Genes",             "ZNF / Other Regulators",
+  "ZNF610_TARGET_GENES",         "ZNF610 Target Genes",             "ZNF / Other Regulators",
+  "ZBTB44_TARGET_GENES",         "ZBTB44 Target Genes",             "ZNF / Other Regulators"
+)
+
+# ── 3. Join curated labels with actual ORA values ────────────────────────────
+join_values <- function(terms_tbl, ora_df) {
+  terms_tbl %>%
+    left_join(
+      ora_df %>% select(Description, FoldEnrichment, p.adjust,
+                        Count, GeneRatio_num, neg_log10_padj),
+      by = "Description"
+    )
+}
+
+go_plot  <- join_values(go_terms,  go_df)
+cp_plot  <- join_values(cp_terms,  cp_df)
+hl_plot  <- join_values(hl_terms,  hl_df)
+tft_plot <- join_values(tft_terms, tft_df)
+
+# Quick check
+check_missing <- function(df, name) {
+  miss <- df %>% filter(is.na(FoldEnrichment)) %>% pull(Description)
+  if (length(miss) > 0)
+    warning(name, " — unmatched: ", paste(miss, collapse = ", "))
+  else
+    message(name, ": all ", nrow(df), " terms matched OK")
+}
+check_missing(go_plot,  "GO")
+check_missing(cp_plot,  "CP")
+check_missing(hl_plot,  "Hallmark")
+check_missing(tft_plot, "TFT")
+
+# ── 4. Factor ordering (within theme: highest FE at top; themes by list order)
+order_plot_df <- function(df, theme_order) {
+  df %>%
+    mutate(Theme = factor(Theme, levels = rev(theme_order))) %>%
+    group_by(Theme) %>%
+    arrange(Theme, FoldEnrichment) %>%
+    ungroup() %>%
+    mutate(Display_Label = factor(Display_Label, levels = unique(Display_Label)))
+}
+
+go_theme_order <- c(
+  "Epigenetic Reprogramming",
+  "miRNA Biology",
+  "Transcription Regulation",
+  "Angiogenesis & Vascular Dev",
+  "Cell Motility & Morphology",
+  "Growth & Hormone Response",
+  "Intracellular Trafficking",
+  "Circadian Rhythm",
+  "DNA Damage & Stress"
+)
+
+cp_theme_order <- c(
+  "Oncogenic Signaling",
+  "Angiogenesis & EMT",
+  "Cancer-Specific Pathways",
+  "TF-Driven Pathways",
+  "Therapy Resistance",
+  "DNA Damage & Stress",
+  "Metabolic Reprogramming",
+  "miRNA / Immune"
+)
+
+hl_theme_order <- c(
+  "Protein Secretion & EV Biology",
+  "Cell Survival",
+  "DNA Damage & Stress"
+)
+
+tft_theme_order <- c(
+  "YY1 \u2014 Epigenetic Master",
+  "SOX / EMT Factors",
+  "Proliferation (MYC/MYB/E2F)",
+  "Stress & Immune (HSF/NRF/CREB)",
+  "Hypoxia & Metabolism",
+  "Ras/MAPK Response",
+  "Developmental / Stem Cell",
+  "ZNF / Other Regulators"
+)
+
+go_plot  <- order_plot_df(go_plot,  go_theme_order)
+cp_plot  <- order_plot_df(cp_plot,  cp_theme_order)
+hl_plot  <- order_plot_df(hl_plot,  hl_theme_order)
+tft_plot <- order_plot_df(tft_plot, tft_theme_order)
+
+# ── 5. Colour palettes ────────────────────────────────────────────────────────
+fdr_pal <- c("#FFF5B0", "#FDB462", "#C0392B")
+
+go_strip_cols <- c(
+  "Epigenetic Reprogramming"   = "#6A3D9A",
+  "miRNA Biology"              = "#C449A0",
+  "Transcription Regulation"   = "#9467BD",
+  "Angiogenesis & Vascular Dev"= "#00ACC1",
+  "Cell Motility & Morphology" = "#1565C0",
+  "Growth & Hormone Response"  = "#D62728",
+  "Intracellular Trafficking"  = "#7B3F00",
+  "Circadian Rhythm"           = "#8D6E08",
+  "DNA Damage & Stress"        = "#E65100"
+)
+
+cp_strip_cols <- c(
+  "Oncogenic Signaling"        = "#D62728",
+  "Angiogenesis & EMT"         = "#00ACC1",
+  "Cancer-Specific Pathways"   = "#C449A0",
+  "TF-Driven Pathways"         = "#6A3D9A",
+  "Therapy Resistance"         = "#E65100",
+  "DNA Damage & Stress"        = "#7B3F00",
+  "Metabolic Reprogramming"    = "#8D6E08",
+  "miRNA / Immune"             = "#2E7D32"
+)
+
+hl_strip_cols <- c(
+  "Protein Secretion & EV Biology" = "#6A3D9A",
+  "Cell Survival"                  = "#D62728",
+  "DNA Damage & Stress"            = "#E65100"
+)
+
+tft_strip_cols <- c(
+  "YY1 \u2014 Epigenetic Master"   = "#6A3D9A",
+  "SOX / EMT Factors"              = "#1565C0",
+  "Proliferation (MYC/MYB/E2F)"    = "#D62728",
+  "Stress & Immune (HSF/NRF/CREB)" = "#2E7D32",
+  "Hypoxia & Metabolism"           = "#E65100",
+  "Ras/MAPK Response"              = "#C449A0",
+  "Developmental / Stem Cell"      = "#7B3F00",
+  "ZNF / Other Regulators"         = "#546E7A"
+)
+
+# ── 6. Core dot-plot function ─────────────────────────────────────────────────
+make_panel <- function(df, title_str) {
+
+  x_max   <- max(df$FoldEnrichment, na.rm = TRUE) + 0.35
+  fdr_max <- max(df$neg_log10_padj, na.rm = TRUE)
+
+  ggplot(df, aes(x = FoldEnrichment, y = Display_Label)) +
+
+    # Vertical reference at FE = 1
+    geom_vline(xintercept = 1, linetype = "dashed",
+               colour = "grey55", linewidth = 0.45) +
+
+    # Main dots
+    geom_point(aes(size = Count, colour = neg_log10_padj), alpha = 0.88) +
+
+    # Facet by theme, strips on left
+    facet_grid(Theme ~ ., scales = "free_y", space = "free_y", switch = "y") +
+
+    # Colour: -log10(FDR)
+    scale_colour_gradientn(
+      colours  = fdr_pal,
+      limits   = c(0, fdr_max),
+      name     = expression(-log[10](FDR)),
+      guide    = guide_colorbar(
+        title.position = "top",
+        barwidth  = unit(4, "cm"),
+        barheight = unit(0.4, "cm"),
+        frame.colour = "grey50"
+      )
+    ) +
+
+    # Size: gene count
+    scale_size_continuous(
+      range  = c(2.5, 9),
+      name   = "Gene count",
+      guide  = guide_legend(
+        title.position = "top",
+        nrow = 1,
+        override.aes = list(colour = "grey35")
+      )
+    ) +
+
+    # Axes
+    scale_x_continuous(
+      name   = "Fold Enrichment",
+      limits = c(0.85, x_max),
+      breaks = pretty_breaks(n = 4),
+      expand = expansion(mult = c(0.01, 0.04))
+    ) +
+    scale_y_discrete(name = NULL) +
+
+    labs(title = title_str) +
+
+    theme_bw(base_size = 11) +
+    theme(
+      plot.title          = element_text(face = "bold", size = 11.5,
+                                          margin = margin(b = 5)),
+      # Strip
+      strip.placement     = "outside",
+      strip.background    = element_rect(fill = "grey25", colour = NA),
+      strip.text.y.left   = element_text(
+        angle  = 0, hjust = 1, vjust = 0.5,
+        size   = 7.5, face = "bold", colour = "white",
+        margin = margin(l = 4, r = 4, t = 1, b = 1)
+      ),
+      # Panel
+      panel.border        = element_rect(colour = "grey70", fill = NA,
+                                          linewidth = 0.45),
+      panel.grid.major.y  = element_blank(),
+      panel.grid.major.x  = element_line(colour = "grey87",
+                                          linetype = "dotted", linewidth = 0.4),
+      panel.grid.minor    = element_blank(),
+      panel.spacing       = unit(0.18, "lines"),
+      # Axes
+      axis.text.y         = element_text(size = 8, colour = "grey10"),
+      axis.text.x         = element_text(size = 8),
+      axis.title.x        = element_text(size = 9, margin = margin(t = 5)),
+      # Legend
+      legend.position     = "bottom",
+      legend.box          = "horizontal",
+      legend.title        = element_text(size = 8.5, face = "bold"),
+      legend.text         = element_text(size = 8),
+      legend.margin       = margin(t = 2),
+      # Margins
+      plot.margin         = margin(t = 6, r = 8, b = 4, l = 4)
+    ) +
+    coord_cartesian(clip = "off")
+}
+
+# ── 7. Build panels ───────────────────────────────────────────────────────────
+p_go  <- make_panel(go_plot,  "Gene Ontology (BP + MF + CC)")
+p_cp  <- make_panel(cp_plot,  "Canonical Pathways (KEGG / Reactome / WikiPathways / PID)")
+p_hl  <- make_panel(hl_plot,  "MSigDB Hallmark\n(3 significant terms at FDR < 0.05)")
+p_tft <- make_panel(tft_plot, "Transcription Factor Targets (TFT)")
+
+# ── 8. Apply per-strip theme colours via grob editing ────────────────────────
+colour_strips <- function(p, col_map) {
+  library(grid)
+  gt         <- ggplotGrob(p)
+  strip_idx  <- which(grepl("^strip-l", gt$layout$name))
+  theme_lvls <- levels(p$data$Theme)  # already reversed
+
+  for (i in seq_along(strip_idx)) {
+    # grobs run top→bottom; factor levels run bottom→top → map from end
+    tn  <- theme_lvls[length(theme_lvls) - i + 1]
+    col <- col_map[[tn]]
+    if (!is.null(col)) {
+      sg <- gt$grobs[[strip_idx[i]]]
+      sg$grobs[[1]]$children[[1]]$gp$fill <- col   # bg rect
+      sg$grobs[[1]]$children[[2]]$gp$col  <- "white" # text
+      gt$grobs[[strip_idx[i]]] <- sg
+    }
+  }
+  gt
+}
+
+# ── 9. Auto-height save helper ────────────────────────────────────────────────
+save_panel <- function(p, col_map, stem, width = 8.5, pts_per_row = 0.27, min_h = 3.5) {
+
+  n_rows <- nrow(p$data)
+  n_themes <- n_distinct(p$data$Theme)
+  h <- max(min_h, n_rows * pts_per_row + n_themes * 0.25 + 2.5)
+
+  # Plain (always works)
+  ggsave(paste0(stem, ".pdf"), p,
+         width = width, height = h, units = "in", device = cairo_pdf)
+  ggsave(paste0(stem, ".png"), p,
+         width = width, height = h, units = "in", dpi = 300, bg = "white")
+  message("Saved: ", stem, ".pdf / .png  (", round(h, 1), "in tall)")
+
+  # Coloured-strip version
+  tryCatch({
+    gt <- colour_strips(p, col_map)
+
+    pdf(paste0(stem, "_col.pdf"), width = width, height = h)
+    grid::grid.draw(gt)
+    dev.off()
+
+    png(paste0(stem, "_col.png"),
+        width = width, height = h, units = "in", res = 300, bg = "white")
+    grid::grid.draw(gt)
+    dev.off()
+
+    message("Saved: ", stem, "_col.pdf / .png  (coloured strips)")
+  }, error = function(e) {
+    message("Strip colour edit failed for ", stem, ": ", conditionMessage(e))
+    message("Tip: install ggh4x for a more reliable alternative.")
+  })
+}
+
+message("\n--- Saving individual panels ---")
+save_panel(p_go,  go_strip_cols,  "ORA_GO_top30")
+save_panel(p_cp,  cp_strip_cols,  "ORA_CP_top30")
+save_panel(p_hl,  hl_strip_cols,  "ORA_Hallmark_top30",  width = 6, min_h = 2.5)
+save_panel(p_tft, tft_strip_cols, "ORA_TFT_top30")
+
+# ── 10. Combined 2×2 figure ───────────────────────────────────────────────────
+message("\n--- Saving combined 4-panel figure ---")
+
+combined <- (p_go | p_cp) / (p_tft | p_hl) +
+  plot_annotation(
+    title    = paste0("Over-Representation Analysis \u2014 ",
+                      "miR-509-3p / miR-377-3p / miR-378h Target Genes"),
+    subtitle = paste0("Top 30 terms per database (FDR < 0.05), ",
+                      "grouped by biological theme. ",
+                      "Dot size = gene count; colour = \u2212log\u2081\u2080(FDR)."),
+    caption  = paste0(
+      "Databases: GO (BP+MF+CC), Canonical Pathways (KEGG/Reactome/WikiPathways/PID), ",
+      "MSigDB Hallmark, TFT.\n",
+      "Off-target neuronal/embryonic terms and unknown TFT motifs excluded.\n",
+      "Hallmark: only 3 terms reach FDR < 0.05."
+    ),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 14, hjust = 0),
+      plot.subtitle = element_text(size = 10, colour = "grey30", hjust = 0,
+                                    margin = margin(b = 6)),
+      plot.caption  = element_text(size = 7.5, colour = "grey45", hjust = 0,
+                                    margin = margin(t = 6))
+    )
+  )
+
+ggsave("ORA_4panel_top30.pdf", combined,
+       width = 20, height = 26, units = "in", device = cairo_pdf)
+ggsave("ORA_4panel_top30.png", combined,
+       width = 20, height = 26, units = "in", dpi = 180, bg = "white")
+message("Saved: ORA_4panel_top30.pdf / .png")
+
+# ── 11. ggh4x alternative (cleaner strip colours) ────────────────────────────
+# If ggh4x is installed, replace facet_grid() in make_panel() with:
+#
+#   library(ggh4x)
+#   # Pass strip_col_map to make_panel() and build strip_designs inside:
+#   strip_designs <- strip_themed(
+#     background_y = elem_list_rect(
+#       fill = unname(col_map[rev(theme_order)])
+#     ),
+#     text_y = elem_list_text(
+#       colour = "white", face = "bold", angle = 0
+#     )
+#   )
+#   facet_grid2(Theme ~ ., scales = "free_y", space = "free_y",
+#               switch = "y", strip = strip_designs)
+
+message("\nAll done.")
+```
+
+
+
+
+
+
+
+
+

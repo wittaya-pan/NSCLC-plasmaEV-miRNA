@@ -1,0 +1,20 @@
+{
+  "title": "Analysis code: Plasma extracellular vesicle-derived microRNAs associated with overall survival in advanced non-targeted NSCLC (pilot study)",
+  "upload_type": "software",
+  "version": "1.0.0",
+  "description": "R and Python code for the analyses in \"Plasma Extracellular Vesicle-Derived MicroRNAs Associated with Overall Survival in Advanced Non-Targeted NSCLC: A Pilot Study\": discovery of candidate plasma EV miRNAs (differential expression, univariate Cox, random survival forest, LASSO-penalized Cox), bootstrap internal validation, clinical factor models, sensitivity analyses, exploratory TCGA analyses and target pathway enrichment. No patient data are included; the NanoString nCounter data and de-identified clinical characteristics are in NCBI GEO under accession GSE352464.",
+  "creators": [
+    {"name": "Panvongsa, Wittaya", "affiliation": "Department of Tropical Nutrition and Food Science, Faculty of Tropical Medicine, Mahidol University, Bangkok, Thailand", "orcid": "0009-0000-2409-9621"},
+    {"name": "Oranratnachai, Songporn", "affiliation": "Center for Medical Genomics, Faculty of Medicine Ramathibodi Hospital, Mahidol University, Bangkok, Thailand", "orcid": "0000-0003-3036-2478"},
+    {"name": "Trachu, Narumol", "affiliation": "Offices of Health Science Research, Faculty of Medicine Ramathibodi Hospital, Mahidol University, Bangkok, Thailand", "orcid": "0000-0003-3735-493X"},
+    {"name": "Khiewngam, Khantong", "affiliation": "Division of Medical Oncology, Department of Medicine, Faculty of Medicine Ramathibodi Hospital, Mahidol University, Bangkok, Thailand"},
+    {"name": "Monnamo, Nanamon", "affiliation": "Offices of Health Science Research, Faculty of Medicine Ramathibodi Hospital, Mahidol University, Bangkok, Thailand", "orcid": "0009-0003-6615-6796"},
+    {"name": "Reungwetwattana, Thanyanan", "affiliation": "Division of Medical Oncology, Department of Medicine, Faculty of Medicine Ramathibodi Hospital, Mahidol University, Bangkok, Thailand", "orcid": "0000-0002-3147-7640"},
+    {"name": "Chairoungdua, Arthit", "affiliation": "Department of Physiology, Faculty of Science, Mahidol University, Bangkok, Thailand", "orcid": "0000-0002-0965-126X"}
+  ],
+  "license": "MIT",
+  "keywords": ["extracellular vesicle", "liquid biopsy", "microRNA", "non-small cell lung cancer", "overall survival", "prognostic biomarker", "NanoString nCounter"],
+  "related_identifiers": [
+    {"identifier": "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE352464", "relation": "references", "resource_type": "dataset"}
+  ]
+}

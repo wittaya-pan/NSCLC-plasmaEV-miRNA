@@ -1,0 +1,580 @@
+---
+title: "new34_normal"
+output: html_notebook
+---
+
+
+```{r}
+# ==============================================================================
+# 3-miRNA Z-score Prognostic Risk Score — STANDALONE VERSION
+# Normal Tissue vs Tumor | TCGA-LUAD & TCGA-LUSC
+#
+# Model:  RiskScore = z(hsa-miR-509-3p) * 0.743
+#                   + z(hsa-miR-377-3p) * 0.503
+#                   + z(hsa-miR-378h)   * (-0.663)
+#
+# RDS format: data.frame with columns
+#   miRNA_ID  : precursor names (e.g. hsa-mir-509-1)
+#   reads_per_million_miRNA_mapped_TCGA-XX-XXXX-01A-... : one col per sample
+# ==============================================================================
+
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(tidyr)
+library(tibble)
+library(patchwork)
+
+
+# ==============================================================================
+# ── USER SETTINGS — edit these paths ──────────────────────────────────────────
+# ==============================================================================
+
+RDS_LUAD    <- "TCGA_LUAD_miRNA_NormalTumor_SE.rds"
+RDS_LUSC    <- "TCGA_LUSC_miRNA_NormalTumor_SE.rds"
+BETAS_CSV   <- "Final_Cox_betas_for_risk_score_borda_zscore.csv"
+LUAD_NT_CSV <- "luad_nontargeted_cases.csv"   # column: case_id
+LUSC_NT_CSV <- "lusc_nontargeted_cases.csv"   # column: case_id
+OUT_DIR     <- "Output_NormalVsTumor"
+
+# ==============================================================================
+
+dir.create(OUT_DIR, showWarnings = FALSE)
+
+
+# ==============================================================================
+# STEP 1 — Load files
+# ==============================================================================
+
+cat("── Loading RDS files ──\n")
+luad_mirna_df <- readRDS(RDS_LUAD)
+lusc_mirna_df <- readRDS(RDS_LUSC)
+
+cat("LUAD class:", class(luad_mirna_df), "| dim:", paste(dim(luad_mirna_df), collapse = " x "), "\n")
+cat("LUSC class:", class(lusc_mirna_df), "| dim:", paste(dim(lusc_mirna_df), collapse = " x "), "\n")
+
+# Peek at column structure
+cat("\nLUAD first 3 column names:\n")
+print(head(colnames(luad_mirna_df), 3))
+cat("LUAD miRNA_ID sample:\n")
+print(head(luad_mirna_df$miRNA_ID, 5))
+
+betas    <- read.csv(BETAS_CSV)
+beta_vec <- setNames(betas$coef, betas$miRNA_dash)
+cat("\n=== 3-miRNA Beta Coefficients ===\n")
+print(beta_vec)
+
+luad_nt_cases <- read.csv(LUAD_NT_CSV)$case_id
+lusc_nt_cases <- read.csv(LUSC_NT_CSV)$case_id
+cat("\nNon-targeted — LUAD:", length(luad_nt_cases),
+    "| LUSC:", length(lusc_nt_cases), "\n")
+
+
+# ==============================================================================
+# STEP 2 — Build combined_long from data.frame RDS
+#
+# Column pattern: reads_per_million_miRNA_mapped_TCGA-XX-XXXX-01A-...
+#   sample type = substr(barcode, 14, 15) → "01" = tumor, "11" = normal
+# ==============================================================================
+
+build_long_from_df <- function(mirna_df, project) {
+
+  # Identify RPM columns
+  rpm_cols <- grep("^reads_per_million_miRNA_mapped_TCGA-",
+                   colnames(mirna_df), value = TRUE)
+  cat(project, "— RPM columns found:", length(rpm_cols), "\n")
+
+  if (length(rpm_cols) == 0) {
+    stop("No RPM columns found in ", project,
+         "\nColumn names start with: ",
+         paste(head(colnames(mirna_df), 5), collapse = ", "))
+  }
+
+  # Extract expression matrix
+  expr        <- as.matrix(mirna_df[, rpm_cols])
+  mode(expr)  <- "numeric"
+  rownames(expr) <- mirna_df$miRNA_ID
+
+  # Clean barcodes: strip prefix
+  barcodes <- sub("^reads_per_million_miRNA_mapped_", "", rpm_cols)
+
+  # Assign tissue type from barcode position 14-15
+  type_code   <- substr(barcodes, 14, 15)
+  tissue_type <- dplyr::case_when(
+    type_code == "01" ~ "Primary Tumor",
+    type_code == "11" ~ "Solid Normal",
+    TRUE              ~ NA_character_
+  )
+
+  cat(project, "— Sample types found:", paste(sort(unique(type_code)), collapse = ", "), "\n")
+
+  # Keep only Tumor and Normal
+  keep        <- !is.na(tissue_type)
+  expr        <- expr[, keep, drop = FALSE]
+  barcodes    <- barcodes[keep]
+  tissue_type <- tissue_type[keep]
+
+  # Deduplicate: one sample per patient per tissue type
+  case_ids <- toupper(substr(barcodes, 1, 12))
+  dup_key  <- paste(case_ids, tissue_type, sep = "_")
+  keep2    <- !duplicated(dup_key)
+  expr        <- expr[, keep2, drop = FALSE]
+  barcodes    <- barcodes[keep2]
+  tissue_type <- tissue_type[keep2]
+
+  cat(project, "— After dedup:",
+      "Tumor =",  sum(tissue_type == "Primary Tumor"),
+      "| Normal =", sum(tissue_type == "Solid Normal"), "\n")
+
+  # Long format
+  colnames(expr) <- barcodes
+  long_df <- as.data.frame(expr) %>%
+    rownames_to_column("miRNA_ID") %>%
+    pivot_longer(
+      cols      = -miRNA_ID,
+      names_to  = "Barcode",
+      values_to = "RPM"
+    ) %>%
+    mutate(
+      Tissue_Type = tissue_type[match(Barcode, barcodes)],
+      Project     = project
+    )
+
+  long_df
+}
+
+cat("\n── Building combined_long ──\n")
+luad_long    <- build_long_from_df(luad_mirna_df, "TCGA-LUAD")
+lusc_long    <- build_long_from_df(lusc_mirna_df, "TCGA-LUSC")
+combined_long <- bind_rows(luad_long, lusc_long)
+
+cat("\ncombined_long:", nrow(combined_long), "rows\n")
+print(table(combined_long$Tissue_Type, combined_long$Project))
+
+
+# ==============================================================================
+# STEP 3 — Verify signature miRNA names in TCGA data
+# ==============================================================================
+
+cat("\n=== TCGA precursor IDs for 3 signature miRNAs ===\n")
+cat("miR-509 family : "); print(grep("509",  unique(combined_long$miRNA_ID), value = TRUE))
+cat("miR-377 family : "); print(grep("377",  unique(combined_long$miRNA_ID), value = TRUE))
+cat("miR-378h family: "); print(grep("378h", unique(combined_long$miRNA_ID), value = TRUE))
+
+# NOTE: if names differ from below, update the filter strings in STEP 4
+
+
+# ==============================================================================
+# STEP 4 — Extract & Aggregate Signature miRNAs
+# ==============================================================================
+
+mir509 <- combined_long %>%
+  filter(miRNA_ID %in% c("hsa-mir-509-1", "hsa-mir-509-2", "hsa-mir-509-3")) %>%
+  group_by(Barcode, Tissue_Type, Project) %>%
+  summarise(RPM = sum(RPM, na.rm = TRUE), .groups = "drop") %>%
+  mutate(miRNA_ID = "hsa-miR-509-3p")
+
+mir377 <- combined_long %>%
+  filter(miRNA_ID == "hsa-mir-377") %>%
+  mutate(miRNA_ID = "hsa-miR-377-3p")
+
+mir378h <- combined_long %>%
+  filter(miRNA_ID == "hsa-mir-378h") %>%
+  mutate(miRNA_ID = "hsa-miR-378h")
+
+sig_long <- bind_rows(mir509, mir377, mir378h)
+
+cat("\n=== Signature miRNA sample coverage ===\n")
+print(
+  sig_long %>%
+    group_by(Project, Tissue_Type, miRNA_ID) %>%
+    summarise(n = n_distinct(Barcode), .groups = "drop") %>%
+    pivot_wider(names_from = miRNA_ID, values_from = n)
+)
+
+# Check miR-378h zero rate (known dropout in TCGA RNA-seq)
+cat("\n=== miR-378h zero-RPM rate ===\n")
+mir378h %>%
+  group_by(Project, Tissue_Type) %>%
+  summarise(
+    n        = n(),
+    pct_zero = round(100 * mean(RPM == 0, na.rm = TRUE), 1),
+    mean_RPM = round(mean(RPM, na.rm = TRUE), 3),
+    .groups  = "drop"
+  ) %>%
+  print()
+
+cat("\nNOTE: If miR-378h is >90% zero, it has platform dropout in TCGA.\n")
+cat("      The risk score will still be computed but miR-378h contribution\n")
+cat("      will be near-zero after z-scoring.\n\n")
+
+
+# ==============================================================================
+# STEP 5 — Compute Risk Score
+# ==============================================================================
+
+sig_wide <- sig_long %>%
+  mutate(log2RPM1 = log2(RPM + 1)) %>%
+  dplyr::select(Barcode, Tissue_Type, Project, miRNA_ID, log2RPM1) %>%
+  pivot_wider(names_from = miRNA_ID, values_from = log2RPM1)
+
+# Z-score within each cohort (Normal + Tumor pooled — matches training)
+sig_wide <- sig_wide %>%
+  group_by(Project) %>%
+  mutate(
+    z_509  = as.numeric(scale(`hsa-miR-509-3p`)),
+    z_377  = as.numeric(scale(`hsa-miR-377-3p`)),
+    z_378h = as.numeric(scale(`hsa-miR-378h`))
+  ) %>%
+  ungroup() %>%
+  mutate(
+    RiskScore   = z_509  * beta_vec["hsa-miR-509-3p"] +
+                  z_377  * beta_vec["hsa-miR-377-3p"]  +
+                  z_378h * beta_vec["hsa-miR-378h"],
+    case_id     = toupper(substr(Barcode, 1, 12)),
+    sample_type = substr(Barcode, 14, 15)
+  )
+
+cat("=== Risk Score summary ===\n")
+print(
+  sig_wide %>%
+    group_by(Project, Tissue_Type) %>%
+    summarise(
+      n      = n(),
+      Mean   = round(mean(RiskScore,   na.rm = TRUE), 3),
+      Median = round(median(RiskScore, na.rm = TRUE), 3),
+      SD     = round(sd(RiskScore,     na.rm = TRUE), 3),
+      .groups = "drop"
+    )
+)
+
+
+# ==============================================================================
+# STEP 6 — Build Comparison Groups
+# ==============================================================================
+
+normal_samples <- sig_wide %>%
+  filter(Tissue_Type == "Solid Normal") %>%
+  mutate(Group = "Normal Tissue") %>%
+  dplyr::select(case_id, Barcode, Project, RiskScore, Group)
+
+all_tumor <- sig_wide %>%
+  filter(Tissue_Type == "Primary Tumor", sample_type == "01") %>%
+  mutate(Group = "All Tumor") %>%
+  dplyr::select(case_id, Barcode, Project, RiskScore, Group)
+
+nt_tumor <- sig_wide %>%
+  filter(
+    Tissue_Type == "Primary Tumor",
+    sample_type == "01",
+    (Project == "TCGA-LUAD" & case_id %in% toupper(luad_nt_cases)) |
+    (Project == "TCGA-LUSC" & case_id %in% toupper(lusc_nt_cases))
+  ) %>%
+  mutate(Group = "Non-Targeted Tumor") %>%
+  dplyr::select(case_id, Barcode, Project, RiskScore, Group)
+
+cat("\n=== Group sizes ===\n")
+cat(sprintf("Normal       — LUAD: %d | LUSC: %d\n",
+            sum(normal_samples$Project == "TCGA-LUAD"),
+            sum(normal_samples$Project == "TCGA-LUSC")))
+cat(sprintf("All Tumor    — LUAD: %d | LUSC: %d\n",
+            sum(all_tumor$Project == "TCGA-LUAD"),
+            sum(all_tumor$Project == "TCGA-LUSC")))
+cat(sprintf("Non-Targeted — LUAD: %d | LUSC: %d\n",
+            sum(nt_tumor$Project == "TCGA-LUAD"),
+            sum(nt_tumor$Project == "TCGA-LUSC")))
+
+# Sanity check: NT cases matched
+cat(sprintf("\nNT match rate — LUAD: %d / %d cases found in miRNA data\n",
+            sum(toupper(luad_nt_cases) %in% nt_tumor$case_id[nt_tumor$Project == "TCGA-LUAD"]),
+            length(luad_nt_cases)))
+cat(sprintf("NT match rate — LUSC: %d / %d cases found in miRNA data\n",
+            sum(toupper(lusc_nt_cases) %in% nt_tumor$case_id[nt_tumor$Project == "TCGA-LUSC"]),
+            length(lusc_nt_cases)))
+
+
+# ==============================================================================
+# STEP 7 — Helper Functions
+# ==============================================================================
+
+get_wilcox_stats <- function(df, cohort_name = "") {
+  wx <- wilcox.test(RiskScore ~ Group, data = df)
+  p  <- wx$p.value
+
+  grp <- df %>%
+    group_by(Group) %>%
+    summarise(n = n(), median = median(RiskScore, na.rm = TRUE), .groups = "drop")
+
+  cat(cohort_name, "\n")
+  for (i in seq_len(nrow(grp))) {
+    cat(sprintf("  %-25s n = %3d | median = %6.3f\n",
+                grp$Group[i], grp$n[i], grp$median[i]))
+  }
+  cat("  Wilcoxon p =", formatC(p, digits = 3, format = "g"), "\n\n")
+
+  list(p = p, ns = setNames(grp$n, grp$Group))
+}
+
+plot_risk_comparison <- function(df, cohort_name, stats,
+                                  group_levels, fill_colors, title_suffix) {
+  df <- df %>% mutate(Group = factor(Group, levels = group_levels))
+
+  caption_text <- paste0(
+    "Wilcoxon rank-sum test, ", pvalue(stats$p, accuracy = 0.001), "\n",
+    paste(paste0("n(", names(stats$ns), ") = ", stats$ns), collapse = "  |  ")
+  )
+
+  subtitle_text <- paste0(
+    "Y-axis zoomed to -3 to +3  |  Z-scored within cohort\n",
+    "miR-509-3p (β=", round(beta_vec["hsa-miR-509-3p"], 3), ")",
+    "  +  miR-377-3p (β=", round(beta_vec["hsa-miR-377-3p"], 3), ")",
+    "  +  miR-378h (β=",   round(beta_vec["hsa-miR-378h"],   3), ")"
+  )
+
+  ggplot(df, aes(x = Group, y = RiskScore, fill = Group)) +
+    geom_boxplot(outlier.shape = NA, width = 0.5) +
+    geom_jitter(width = 0.1, alpha = 0.4, size = 0.8) +
+    coord_cartesian(ylim = c(-3, 3)) +
+    scale_fill_manual(values = fill_colors) +
+    labs(
+      title    = paste0(cohort_name, " — 3-miRNA Risk Score: ", title_suffix),
+      subtitle = subtitle_text,
+      x        = NULL,
+      y        = "3-miRNA Risk Score",
+      caption  = caption_text
+    ) +
+    theme_bw() +
+    theme(
+      legend.position  = "none",
+      plot.caption     = element_text(hjust = 0, face = "italic", size = 9),
+      plot.title       = element_text(face = "bold", size = 12),
+      plot.subtitle    = element_text(size = 9, color = "grey40"),
+      axis.text        = element_text(size = 11),
+      panel.grid.minor = element_blank()
+    )
+}
+
+save_plot <- function(p, filename, w = 1800, h = 2000) {
+  path <- file.path(OUT_DIR, filename)
+  png(path, width = w, height = h, res = 300)
+  print(p)
+  dev.off()
+  cat("Saved:", path, "\n")
+}
+
+
+# ==============================================================================
+# STEP 8A — Normal vs All Primary Tumor
+# ==============================================================================
+
+cat("══════════════════════════════════════════\n")
+cat("COMPARISON A: Normal vs All Primary Tumor\n")
+cat("══════════════════════════════════════════\n\n")
+
+luad_all <- bind_rows(
+  filter(normal_samples, Project == "TCGA-LUAD"),
+  filter(all_tumor,      Project == "TCGA-LUAD")
+) %>% mutate(Group = factor(Group, levels = c("Normal Tissue", "All Tumor")))
+
+lusc_all <- bind_rows(
+  filter(normal_samples, Project == "TCGA-LUSC"),
+  filter(all_tumor,      Project == "TCGA-LUSC")
+) %>% mutate(Group = factor(Group, levels = c("Normal Tissue", "All Tumor")))
+
+luad_all_stats <- get_wilcox_stats(luad_all, "TCGA-LUAD | Normal vs All Tumor")
+lusc_all_stats <- get_wilcox_stats(lusc_all, "TCGA-LUSC | Normal vs All Tumor")
+
+COLORS_A <- c("Normal Tissue" = "#3498DB", "All Tumor" = "#E74C3C")
+
+p_luad_all <- plot_risk_comparison(luad_all, "TCGA-LUAD", luad_all_stats,
+                                    c("Normal Tissue", "All Tumor"),
+                                    COLORS_A, "Normal vs All Tumor")
+p_lusc_all <- plot_risk_comparison(lusc_all, "TCGA-LUSC", lusc_all_stats,
+                                    c("Normal Tissue", "All Tumor"),
+                                    COLORS_A, "Normal vs All Tumor")
+
+combined_all <- (p_luad_all | p_lusc_all) +
+  plot_annotation(
+    title    = "3-miRNA Risk Score: Normal Tissue vs All Primary Tumor",
+    subtitle = "TCGA-LUAD and TCGA-LUSC",
+    theme    = theme(plot.title    = element_text(face = "bold", size = 14),
+                     plot.subtitle = element_text(color = "grey40", size = 10))
+  )
+
+save_plot(p_luad_all,   "RiskScore_Normal_vs_AllTumor_LUAD.png")
+save_plot(p_lusc_all,   "RiskScore_Normal_vs_AllTumor_LUSC.png")
+save_plot(combined_all, "RiskScore_Normal_vs_AllTumor_Combined.png", w = 3600)
+cat("✓ Comparison A done.\n\n")
+
+
+# ==============================================================================
+# STEP 8B — Normal vs Non-Targeted Tumor
+# ==============================================================================
+
+cat("══════════════════════════════════════════════════\n")
+cat("COMPARISON B: Normal vs Non-Targeted Tumor\n")
+cat("══════════════════════════════════════════════════\n\n")
+
+luad_nt <- bind_rows(
+  filter(normal_samples, Project == "TCGA-LUAD"),
+  filter(nt_tumor,       Project == "TCGA-LUAD")
+) %>% mutate(Group = factor(Group, levels = c("Normal Tissue", "Non-Targeted Tumor")))
+
+lusc_nt <- bind_rows(
+  filter(normal_samples, Project == "TCGA-LUSC"),
+  filter(nt_tumor,       Project == "TCGA-LUSC")
+) %>% mutate(Group = factor(Group, levels = c("Normal Tissue", "Non-Targeted Tumor")))
+
+luad_nt_stats <- get_wilcox_stats(luad_nt, "TCGA-LUAD | Normal vs Non-Targeted")
+lusc_nt_stats <- get_wilcox_stats(lusc_nt, "TCGA-LUSC | Normal vs Non-Targeted")
+
+COLORS_B <- c("Normal Tissue" = "#3498DB", "Non-Targeted Tumor" = "#E74C3C")
+
+p_luad_nt <- plot_risk_comparison(luad_nt, "TCGA-LUAD", luad_nt_stats,
+                                   c("Normal Tissue", "Non-Targeted Tumor"),
+                                   COLORS_B, "Normal vs Non-Targeted Tumor")
+p_lusc_nt <- plot_risk_comparison(lusc_nt, "TCGA-LUSC", lusc_nt_stats,
+                                   c("Normal Tissue", "Non-Targeted Tumor"),
+                                   COLORS_B, "Normal vs Non-Targeted Tumor")
+
+combined_nt <- (p_luad_nt | p_lusc_nt) +
+  plot_annotation(
+    title    = "3-miRNA Risk Score: Normal Tissue vs Non-Targeted Tumor",
+    subtitle = "TCGA-LUAD and TCGA-LUSC",
+    theme    = theme(plot.title    = element_text(face = "bold", size = 14),
+                     plot.subtitle = element_text(color = "grey40", size = 10))
+  )
+
+save_plot(p_luad_nt,   "RiskScore_Normal_vs_NonTargeted_LUAD.png")
+save_plot(p_lusc_nt,   "RiskScore_Normal_vs_NonTargeted_LUSC.png")
+save_plot(combined_nt, "RiskScore_Normal_vs_NonTargeted_Combined.png", w = 3600)
+cat("✓ Comparison B done.\n\n")
+
+
+# ==============================================================================
+# STEP 9 — Summary Table
+# ==============================================================================
+
+make_summary_row <- function(df, cohort, comparison, stats) {
+  normal_rs <- df$RiskScore[df$Group == "Normal Tissue"]
+  tumor_rs  <- df$RiskScore[df$Group != "Normal Tissue"]
+  data.frame(
+    Cohort        = cohort,
+    Comparison    = comparison,
+    n_Normal      = stats$ns["Normal Tissue"],
+    n_Tumor       = stats$ns[setdiff(names(stats$ns), "Normal Tissue")],
+    Median_Normal = round(median(normal_rs, na.rm = TRUE), 3),
+    Median_Tumor  = round(median(tumor_rs,  na.rm = TRUE), 3),
+    Wilcoxon_p    = formatC(stats$p, digits = 3, format = "g"),
+    Sig           = dplyr::case_when(
+      stats$p < 0.001 ~ "***",
+      stats$p < 0.01  ~ "**",
+      stats$p < 0.05  ~ "*",
+      TRUE            ~ "ns"
+    ),
+    row.names = NULL
+  )
+}
+
+summary_table <- bind_rows(
+  make_summary_row(luad_all, "TCGA-LUAD", "Normal vs All Tumor",          luad_all_stats),
+  make_summary_row(lusc_all, "TCGA-LUSC", "Normal vs All Tumor",          lusc_all_stats),
+  make_summary_row(luad_nt,  "TCGA-LUAD", "Normal vs Non-Targeted Tumor", luad_nt_stats),
+  make_summary_row(lusc_nt,  "TCGA-LUSC", "Normal vs Non-Targeted Tumor", lusc_nt_stats)
+)
+
+cat("═══ FINAL SUMMARY ═══\n")
+print(summary_table, row.names = FALSE)
+
+out_csv <- file.path(OUT_DIR, "Summary_Normal_vs_Tumor_3miRNA_RiskScore.csv")
+write.csv(summary_table, out_csv, row.names = FALSE)
+cat("\n✓ Summary saved to:", out_csv, "\n")
+cat("✓ All outputs in folder:", OUT_DIR, "\n")
+```
+
+
+
+
+```{r}
+# ==============================================================================
+# STEP 8C — Normal vs Tumor: LUAD + LUSC COMBINED
+# ==============================================================================
+
+cat("══════════════════════════════════════════════════\n")
+cat("COMPARISON C: Normal vs Tumor — LUAD + LUSC Pooled\n")
+cat("══════════════════════════════════════════════════\n\n")
+
+# ── C1: Normal vs All Primary Tumor (pooled) ──────────────────────────────────
+combined_all_pool <- bind_rows(normal_samples, all_tumor) %>%
+  mutate(Group = factor(Group, levels = c("Normal Tissue", "All Tumor")))
+
+combined_all_pool_stats <- get_wilcox_stats(combined_all_pool,
+                                             "LUAD+LUSC Combined | Normal vs All Tumor")
+
+p_combined_all_pool <- plot_risk_comparison(
+  combined_all_pool,
+  "TCGA-LUAD + LUSC",
+  combined_all_pool_stats,
+  c("Normal Tissue", "All Tumor"),
+  COLORS_A,
+  "Normal vs All Primary Tumor (Combined)"
+)
+
+save_plot(p_combined_all_pool,
+          "RiskScore_Normal_vs_AllTumor_LUAD_LUSC_Combined.png",
+          w = 1800, h = 1800)
+cat("✓ C1 done.\n\n")
+
+
+# ── C2: Normal vs Non-Targeted Tumor (pooled) ─────────────────────────────────
+combined_nt_pool <- bind_rows(normal_samples, nt_tumor) %>%
+  mutate(Group = factor(Group, levels = c("Normal Tissue", "Non-Targeted Tumor")))
+
+combined_nt_pool_stats <- get_wilcox_stats(combined_nt_pool,
+                                            "LUAD+LUSC Combined | Normal vs Non-Targeted")
+
+p_combined_nt_pool <- plot_risk_comparison(
+  combined_nt_pool,
+  "TCGA-LUAD + LUSC",
+  combined_nt_pool_stats,
+  c("Normal Tissue", "Non-Targeted Tumor"),
+  COLORS_B,
+  "Normal vs Non-Targeted Tumor (Combined)"
+)
+
+save_plot(p_combined_nt_pool,
+          "RiskScore_Normal_vs_NonTargeted_LUAD_LUSC_Combined.png",
+          w = 1800, h = 1800)
+cat("✓ C2 done.\n\n")
+
+
+# ── Side-by-side panel: both pooled comparisons ───────────────────────────────
+combined_pool_panel <- (p_combined_all_pool | p_combined_nt_pool) +
+  plot_annotation(
+    title    = "3-miRNA Risk Score: Normal Tissue vs Tumor — LUAD + LUSC Pooled",
+    subtitle = "Left: All Primary Tumor  |  Right: Non-Targeted Tumor Only",
+    theme    = theme(plot.title    = element_text(face = "bold", size = 14),
+                     plot.subtitle = element_text(color = "grey40", size = 10))
+  )
+
+save_plot(combined_pool_panel,
+          "RiskScore_Normal_vs_Tumor_Pooled_Panel.png",
+          w = 3600, h = 1800)
+cat("✓ Pooled panel saved.\n\n")
+
+
+# ── Update summary table ──────────────────────────────────────────────────────
+summary_table <- bind_rows(
+  summary_table,
+  make_summary_row(combined_all_pool, "LUAD+LUSC", "Normal vs All Tumor",          combined_all_pool_stats),
+  make_summary_row(combined_nt_pool,  "LUAD+LUSC", "Normal vs Non-Targeted Tumor", combined_nt_pool_stats)
+)
+
+cat("═══ UPDATED SUMMARY (including pooled) ═══\n")
+print(summary_table, row.names = FALSE)
+
+out_csv <- file.path(OUT_DIR, "Summary_Normal_vs_Tumor_3miRNA_RiskScore.csv")
+write.csv(summary_table, out_csv, row.names = FALSE)
+cat("\n✓ Summary updated:", out_csv, "\n")
+```
+

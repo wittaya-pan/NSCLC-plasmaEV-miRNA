@@ -1,0 +1,874 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+---
+title: "Normal vs Tumor — Baseline Expression of 3-miRNA Signature"
+output: html_notebook
+---
+---
+title: "Normal vs Tumor — Baseline Expression of 3-miRNA Signature"
+output: html_notebook
+---
+
+```{r}
+# ==============================================================================
+# Normal vs Tumor Baseline Expression — 3-miRNA Signature Components
+# TCGA-LUAD & TCGA-LUSC & Pooled (LUAD + LUSC combined)
+#
+# Signature miRNAs:
+#   hsa-miR-509-3p  (Risk factor,   β = +0.743)
+#   hsa-miR-377-3p  (Risk factor,   β = +0.503)
+#   hsa-miR-378h    (Protective,    β = −0.663)
+#
+# Pipeline (NO risk score applied):
+#   PART 1  — Define signature & precursor mappings
+#   PART 2  — Core extraction function: RPM → log2 for tumor (01) & normal (11)
+#   PART 3  — Run extraction; build LUAD, LUSC, and Pooled long-format data frames
+#   PART 4  — Descriptive statistics (mean, median, SD, zero%)
+#   PART 5  — Wilcoxon test (normal vs tumor) per miRNA per cohort + Pooled
+#   PART 6  — Colour palette & theme
+#   PART 7  — Violin + boxplot per individual cohort (LUAD, LUSC)
+#   PART 8  — 6-panel publication figure  (3 miRNAs × 2 cohorts)
+#   PART 8B — 3-panel Pooled figure       (3 miRNAs, LUAD+LUSC combined)
+#   PART 8C — 9-panel mega figure         (3 miRNAs × 3 cohorts side-by-side)
+#   PART 9  — Paired analysis (matched normal-tumor, same patient)
+#   PART 10 — Paired dot plots
+#   PART 11 — Zero-expression rate summary (platform dropout check)
+#   PART 12 — Final output summary
+# ==============================================================================
+
+library(survival)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(patchwork)
+library(scales)
+library(ggpubr)      # for stat_compare_means; install if needed:
+                     # install.packages("ggpubr")
+
+# ==============================================================================
+# ── USER SETTINGS ──────────────────────────────────────────────────────────────
+# ==============================================================================
+
+# RDS files produced by the download step in Script_TCGA_all_cohort
+RDS_LUAD <- "TCGA_LUAD_miRNA_df.rds"
+RDS_LUSC <- "TCGA_LUSC_miRNA_df.rds"
+
+# Output directory
+OUT_DIR  <- "Output_NormalVsTumor_3miRNA"
+
+# Minimum samples per group to run stats
+MIN_N_GROUP <- 5
+
+# ==============================================================================
+
+dir.create(OUT_DIR, showWarnings = FALSE)
+cat("Output directory:", OUT_DIR, "\n")
+
+# ==============================================================================
+# PART 1 — Define the 3 signature miRNAs and their precursor mappings
+# ==============================================================================
+
+SIG <- data.frame(
+  mature_name  = c("hsa-miR-509-3p", "hsa-miR-377-3p", "hsa-miR-378h"),
+  log2_col     = c("log2_hsa_miR_509_3p", "log2_hsa_miR_377_3p", "log2_hsa_miR_378h"),
+  beta         = c(0.743073677989302, 0.502724385364305, -0.663258691980459),
+  direction    = c("Risk (↑ = worse)", "Risk (↑ = worse)", "Protective (↑ = better)"),
+  stringsAsFactors = FALSE
+)
+
+# Precursor → mature mapping (GDC uses lowercase precursor names)
+mature_to_precursor <- list(
+  "hsa-miR-509-3p" = c("hsa-mir-509-1", "hsa-mir-509-2", "hsa-mir-509-3"),
+  "hsa-miR-377-3p" = c("hsa-mir-377"),
+  "hsa-miR-378h"   = c("hsa-mir-378h")
+)
+
+# Fallback candidates for hsa-miR-378h if primary absent
+fallback_378 <- c("hsa-mir-378a", "hsa-mir-378b", "hsa-mir-378c",
+                  "hsa-mir-378d", "hsa-mir-378e", "hsa-mir-378f",
+                  "hsa-mir-378g", "hsa-mir-378i")
+
+cat("\n=== 3-miRNA Signature ===\n")
+print(SIG[, c("mature_name", "beta", "direction")])
+
+# ==============================================================================
+# PART 2 — Core extraction function: RPM → log2 for both tumor & normal
+# ==============================================================================
+# Sample type codes (positions 14-15 of TCGA barcode):
+#   "01" = Primary Solid Tumor
+#   "11" = Solid Tissue Normal
+#   Other types (02=recurrent, 06=metastatic) are excluded.
+
+extract_normal_tumor <- function(rds_path, cohort_label) {
+
+  cat("\n═══", cohort_label, "═══\n")
+
+  mirna_df <- readRDS(rds_path)
+  cat("  RDS loaded:", nrow(mirna_df), "miRNA rows\n")
+
+  # ── Step A: Identify RPM columns ─────────────────────────────────────────
+  rpm_cols <- grep("^reads_per_million_miRNA_mapped_TCGA-",
+                   colnames(mirna_df), value = TRUE)
+  cat("  RPM columns:", length(rpm_cols), "samples\n")
+
+  # Build expression matrix
+  expr_rpm           <- as.matrix(mirna_df[, rpm_cols])
+  mode(expr_rpm)     <- "numeric"
+  rownames(expr_rpm) <- mirna_df$miRNA_ID
+  barcodes           <- sub("^reads_per_million_miRNA_mapped_", "", rpm_cols)
+  colnames(expr_rpm) <- barcodes
+
+  # ── Step B: Sample type annotation ───────────────────────────────────────
+  sample_type_code <- substr(barcodes, 14, 15)
+  type_label       <- dplyr::case_when(
+    sample_type_code == "01" ~ "Tumor",
+    sample_type_code == "11" ~ "Normal",
+    TRUE                      ~ "Other"
+  )
+
+  cat("  Sample type distribution:\n")
+  print(table(type_label))
+
+  # Keep only Tumor (01) and Normal (11)
+  keep        <- type_label %in% c("Tumor", "Normal")
+  expr_rpm    <- expr_rpm[, keep, drop = FALSE]
+  barcodes    <- barcodes[keep]
+  type_label  <- type_label[keep]
+
+  # Derive 12-character case IDs (TCGA-XX-XXXX)
+  case_ids <- toupper(substr(barcodes, 1, 12))
+
+  cat("  After filtering — Tumor:", sum(type_label == "Tumor"),
+      "| Normal:", sum(type_label == "Normal"), "\n")
+
+  # ── Step C: Precursor → mature mapping with 378h fallback ────────────────
+  cat("\n  Precursor mapping:\n")
+  local_mapping <- mature_to_precursor   # copy to modify locally
+
+  for (mature in names(local_mapping)) {
+    prec  <- local_mapping[[mature]]
+    found <- prec[prec %in% rownames(expr_rpm)]
+
+    if (length(found) > 0) {
+      cat("   ", mature, "→", paste(found, collapse = ", "), "✓\n")
+      local_mapping[[mature]] <- found
+    } else {
+      if (mature == "hsa-miR-378h") {
+        avail <- grep("^hsa-mir-378", rownames(expr_rpm), value = TRUE)
+        cat("   ⚠  hsa-mir-378h absent. Available 378 precursors:",
+            paste(avail, collapse = ", "), "\n")
+        fb <- fallback_378[fallback_378 %in% rownames(expr_rpm)]
+        if (length(fb) > 0) {
+          cat("     Using fallback:", paste(fb, collapse = ", "),
+              "— verify biological equivalence.\n")
+          local_mapping[[mature]] <- fb
+        } else {
+          cat("     No 378 precursor found — hsa-miR-378h will be NA.\n")
+          local_mapping[[mature]] <- character(0)
+        }
+      } else {
+        avail_top <- head(rownames(expr_rpm), 20)
+        cat("   ⚠  No precursor found for", mature, "\n")
+        cat("      First 20 miRNA IDs:", paste(avail_top, collapse = ", "), "\n")
+        local_mapping[[mature]] <- character(0)
+      }
+    }
+  }
+
+  # ── Step D: Collapse precursors → mature (sum RPM) ───────────────────────
+  expr_sig <- do.call(rbind, lapply(names(local_mapping), function(mature) {
+    prec <- local_mapping[[mature]]
+    if (length(prec) == 0) {
+      row           <- matrix(NA_real_, nrow = 1, ncol = ncol(expr_rpm))
+      rownames(row) <- mature
+      return(row)
+    }
+    if (length(prec) == 1) {
+      row <- expr_rpm[prec, , drop = FALSE]
+    } else {
+      row <- matrix(colSums(expr_rpm[prec, , drop = FALSE],
+                            na.rm = TRUE), nrow = 1)
+    }
+    rownames(row) <- mature
+    row
+  }))
+
+  # ── Step E: log2(RPM + 1) ────────────────────────────────────────────────
+  log2_sig <- log2(expr_sig + 1)
+
+  # ── Step F: Build tidy long-format data frame ─────────────────────────────
+  result_df <- data.frame(
+    case_id     = case_ids,
+    barcode     = barcodes,
+    tissue_type = type_label,
+    cohort      = cohort_label,
+    stringsAsFactors = FALSE
+  )
+
+  for (mature in rownames(log2_sig)) {
+    col_name           <- paste0("log2_", gsub("-", "_", mature))
+    result_df[[col_name]] <- as.numeric(log2_sig[mature, ])
+  }
+
+  # Deduplicate within each tissue type (keep first occurrence per case)
+  result_df <- result_df %>%
+    group_by(case_id, tissue_type) %>%
+    slice(1) %>%
+    ungroup()
+
+  cat("  Final df:", nrow(result_df), "rows\n")
+  cat("  Tumor:", sum(result_df$tissue_type == "Tumor"),
+      "| Normal:", sum(result_df$tissue_type == "Normal"), "\n")
+
+  result_df
+}
+
+# ==============================================================================
+# PART 3 — Run extraction for both cohorts & combine
+# ==============================================================================
+
+luad_df <- extract_normal_tumor(RDS_LUAD, "TCGA-LUAD")
+lusc_df <- extract_normal_tumor(RDS_LUSC, "TCGA-LUSC")
+
+# ── Pooled: combine LUAD + LUSC, tag cohort as "LUAD+LUSC (Pooled)" ──────────
+pooled_df <- bind_rows(luad_df, lusc_df) %>%
+  mutate(cohort = "LUAD+LUSC (Pooled)")
+
+combined_df <- bind_rows(luad_df, lusc_df, pooled_df) %>%
+  mutate(tissue_type = factor(tissue_type, levels = c("Normal", "Tumor")))
+
+cat("\n── Combined dataset (LUAD + LUSC + Pooled) ──\n")
+cat("Total rows:", nrow(combined_df), "\n")
+print(combined_df %>% count(cohort, tissue_type))
+
+# Long format for plotting
+log2_cols_present <- SIG$log2_col[SIG$log2_col %in% colnames(combined_df)]
+mirna_missing     <- SIG$mature_name[!SIG$log2_col %in% colnames(combined_df)]
+if (length(mirna_missing) > 0)
+  cat("  ⚠  miRNAs missing from data:", paste(mirna_missing, collapse = ", "), "\n")
+
+long_df <- combined_df %>%
+  pivot_longer(
+    cols      = all_of(log2_cols_present),
+    names_to  = "log2_col",
+    values_to = "log2_expr"
+  ) %>%
+  left_join(SIG %>% select(log2_col, mature_name, beta, direction),
+            by = "log2_col") %>%
+  filter(!is.na(log2_expr))
+
+cat("Long-format rows:", nrow(long_df), "\n")
+
+# ==============================================================================
+# PART 4 — Descriptive statistics
+# ==============================================================================
+
+cat("\n═══ Descriptive Statistics — log2(RPM+1) ═══\n")
+
+desc_stats <- long_df %>%
+  group_by(cohort, mature_name, tissue_type) %>%
+  summarise(
+    n        = n(),
+    mean     = round(mean(log2_expr,   na.rm = TRUE), 4),
+    median   = round(median(log2_expr, na.rm = TRUE), 4),
+    sd       = round(sd(log2_expr,     na.rm = TRUE), 4),
+    q25      = round(quantile(log2_expr, 0.25, na.rm = TRUE), 4),
+    q75      = round(quantile(log2_expr, 0.75, na.rm = TRUE), 4),
+    zero_pct = round(100 * mean(log2_expr == 0, na.rm = TRUE), 1),
+    .groups  = "drop"
+  )
+
+print(desc_stats, n = 50)
+
+write.csv(desc_stats,
+          file.path(OUT_DIR, "Descriptive_Stats_NormalVsTumor.csv"),
+          row.names = FALSE)
+cat("✓ Saved: Descriptive_Stats_NormalVsTumor.csv\n")
+
+# ==============================================================================
+# PART 5 — Wilcoxon rank-sum test (Normal vs Tumor)
+# ==============================================================================
+
+cat("\n═══ Wilcoxon Test — Normal vs Tumor ═══\n")
+
+wilcox_results <- long_df %>%
+  group_by(cohort, mature_name) %>%
+  summarise({
+    grp    <- split(log2_expr, tissue_type)
+    norm_v <- grp[["Normal"]]
+    tum_v  <- grp[["Tumor"]]
+
+    if (length(norm_v) < MIN_N_GROUP || length(tum_v) < MIN_N_GROUP) {
+      tibble(
+        n_normal = length(norm_v),
+        n_tumor  = length(tum_v),
+        median_normal = NA_real_,
+        median_tumor  = NA_real_,
+        W             = NA_real_,
+        p_value       = NA_real_,
+        p_adj_BH      = NA_real_,
+        significance  = "Insufficient n"
+      )
+    } else {
+      wt <- wilcox.test(tum_v, norm_v, exact = FALSE)
+      tibble(
+        n_normal      = length(norm_v),
+        n_tumor       = length(tum_v),
+        median_normal = round(median(norm_v, na.rm = TRUE), 4),
+        median_tumor  = round(median(tum_v,  na.rm = TRUE), 4),
+        W             = round(wt$statistic, 1),
+        p_value       = wt$p.value,
+        p_adj_BH      = NA_real_,   # filled below
+        significance  = ""
+      )
+    }
+  }, .groups = "drop")
+
+# BH correction across all tests
+valid_idx            <- !is.na(wilcox_results$p_value)
+wilcox_results$p_adj_BH[valid_idx] <- p.adjust(
+  wilcox_results$p_value[valid_idx], method = "BH"
+)
+
+# Significance labels
+wilcox_results <- wilcox_results %>%
+  mutate(
+    significance = case_when(
+      is.na(p_adj_BH)    ~ "Insufficient n",
+      p_adj_BH < 0.001   ~ "***",
+      p_adj_BH < 0.01    ~ "**",
+      p_adj_BH < 0.05    ~ "*",
+      TRUE               ~ "ns"
+    ),
+    p_value  = formatC(p_value,  digits = 4, format = "g"),
+    p_adj_BH = formatC(p_adj_BH, digits = 4, format = "g")
+  )
+
+print(wilcox_results, n = 30)
+
+write.csv(wilcox_results,
+          file.path(OUT_DIR, "Wilcoxon_NormalVsTumor.csv"),
+          row.names = FALSE)
+cat("✓ Saved: Wilcoxon_NormalVsTumor.csv\n")
+
+# ==============================================================================
+# PART 6 — Colour palette & theme
+# ==============================================================================
+
+COL_NORMAL <- "#2166AC"   # blue  — normal tissue
+COL_TUMOR  <- "#B2182B"   # red   — tumor tissue
+TISSUE_PAL <- c("Normal" = COL_NORMAL, "Tumor" = COL_TUMOR)
+
+base_theme <- theme_bw(base_size = 11) +
+  theme(
+    plot.title        = element_text(face = "bold", size = 12),
+    plot.subtitle     = element_text(size = 9, color = "grey30"),
+    strip.background  = element_rect(fill = "grey92", color = "grey60"),
+    strip.text        = element_text(face = "bold", size = 10),
+    legend.position   = "none",
+    panel.grid.minor  = element_blank(),
+    axis.title        = element_text(size = 10),
+    axis.text         = element_text(size = 9)
+  )
+
+# ==============================================================================
+# PART 7 — Per-cohort violin + boxplot (one file per cohort)
+# ==============================================================================
+
+cat("\n── Part 7: Violin + box plots per cohort ──\n")
+
+for (coh in c("TCGA-LUAD", "TCGA-LUSC", "LUAD+LUSC (Pooled)")) {
+
+  df_coh <- long_df %>% filter(cohort == coh)
+
+  # Get p-value labels for annotation
+  wt_coh <- wilcox_results %>%
+    filter(cohort == coh) %>%
+    select(mature_name, significance, p_adj_BH)
+
+  # Sample counts label per facet
+  count_lab <- df_coh %>%
+    group_by(mature_name, tissue_type) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    mutate(label = paste0(tissue_type, "\nn=", n)) %>%
+    group_by(mature_name) %>%
+    summarise(count_str = paste(label, collapse = "\n"), .groups = "drop")
+
+  # y-axis max per miRNA for annotation placement
+  y_max_df <- df_coh %>%
+    group_by(mature_name) %>%
+    summarise(y_max = max(log2_expr, na.rm = TRUE) * 1.12, .groups = "drop")
+
+  annot_df <- wt_coh %>%
+    left_join(y_max_df, by = "mature_name") %>%
+    mutate(
+      x       = 1.5,
+      label   = paste0("p.adj = ", p_adj_BH, "\n", significance)
+    )
+
+  p_vio <- ggplot(df_coh,
+                  aes(x = tissue_type, y = log2_expr, fill = tissue_type)) +
+    geom_violin(trim = FALSE, alpha = 0.55, linewidth = 0.4) +
+    geom_boxplot(width = 0.18, outlier.size = 0.8,
+                 outlier.alpha = 0.4, linewidth = 0.5,
+                 fill = "white", alpha = 0.8) +
+    geom_text(data = annot_df,
+              aes(x = x, y = y_max, label = label),
+              inherit.aes = FALSE,
+              size = 3.2, color = "grey20", fontface = "italic",
+              hjust = 0.5) +
+    scale_fill_manual(values = TISSUE_PAL) +
+    facet_wrap(~ mature_name, scales = "free_y", nrow = 1) +
+    labs(
+      title    = paste0(coh, " — Baseline miRNA Expression: Normal vs Tumor"),
+      subtitle = "log2(RPM + 1)  |  Wilcoxon rank-sum test  |  BH-adjusted p-value",
+      x        = "Tissue Type",
+      y        = "Expression  [log2(RPM + 1)]"
+    ) +
+    base_theme
+
+  coh_slug <- gsub("[^A-Za-z0-9]", "_", coh)
+  out_vio  <- file.path(OUT_DIR, paste0("Violin_NvT_", coh_slug, ".png"))
+  png(out_vio, width = 3000, height = 2000, res = 300)
+  print(p_vio)
+  dev.off()
+  cat("  Saved:", out_vio, "\n")
+}
+
+# ==============================================================================
+# PART 8 — Publication-ready panel: all 3 miRNAs × 2 cohorts (6-panel grid)
+# ==============================================================================
+
+cat("\n── Part 8: 6-panel publication plot ──\n")
+
+panel_list <- list()
+
+for (coh in c("TCGA-LUAD", "TCGA-LUSC")) {
+  for (mir in SIG$mature_name) {
+
+    df_sub <- long_df %>%
+      filter(cohort == coh, mature_name == mir)
+
+    if (nrow(df_sub) < 5) {
+      panel_list[[paste(coh, mir)]] <- NULL
+      next
+    }
+
+    wt_row <- wilcox_results %>%
+      filter(cohort == coh, mature_name == mir)
+
+    sig_label <- if (nrow(wt_row) == 0) "" else wt_row$significance[1]
+    p_label   <- if (nrow(wt_row) == 0) "" else
+      paste0("p.adj=", wt_row$p_adj_BH[1], "  ", sig_label)
+
+    # n labels on x-axis
+    n_labs <- df_sub %>%
+      group_by(tissue_type) %>%
+      summarise(n = n(), .groups = "drop") %>%
+      mutate(x_lab = paste0(tissue_type, "\n(n=", n, ")")) %>%
+      deframe()   # named vector: tissue_type → x_lab
+
+    df_sub <- df_sub %>%
+      mutate(x_lab = factor(n_labs[as.character(tissue_type)],
+                            levels = n_labs[c("Normal", "Tumor")]))
+
+    y_top <- max(df_sub$log2_expr, na.rm = TRUE)
+
+    p_panel <- ggplot(df_sub,
+                      aes(x = x_lab, y = log2_expr, fill = tissue_type)) +
+      geom_violin(trim = FALSE, alpha = 0.50, linewidth = 0.35) +
+      geom_boxplot(width = 0.15, outlier.size = 0.6,
+                   outlier.alpha = 0.35, linewidth = 0.45,
+                   fill = "white", alpha = 0.85) +
+      annotate("text", x = 1.5, y = y_top * 1.10,
+               label = p_label, size = 2.8,
+               color = "grey25", fontface = "italic") +
+      scale_fill_manual(values = TISSUE_PAL) +
+      labs(
+        title    = paste0(coh),
+        subtitle = mir,
+        x        = NULL,
+        y        = "log2(RPM + 1)"
+      ) +
+      theme_bw(base_size = 9) +
+      theme(
+        plot.title       = element_text(face = "bold", size = 9),
+        plot.subtitle    = element_text(size = 8, color = "grey20",
+                                        face = "italic"),
+        legend.position  = "none",
+        panel.grid.minor = element_blank(),
+        axis.text        = element_text(size = 8)
+      )
+
+    panel_list[[paste(coh, mir)]] <- p_panel
+  }
+}
+
+# Remove NULLs
+panel_list <- Filter(Negate(is.null), panel_list)
+
+if (length(panel_list) >= 2) {
+  panel_combined <- wrap_plots(panel_list, ncol = 3) +
+    plot_annotation(
+      title    = "Baseline Expression: Normal vs Tumor — 3-miRNA Signature",
+      subtitle = "log2(RPM + 1) · Wilcoxon rank-sum · BH-adjusted p-value · TCGA-LUAD & TCGA-LUSC",
+      theme    = theme(
+        plot.title    = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(color = "grey35",  size = 10)
+      )
+    )
+
+  out_panel <- file.path(OUT_DIR, "Panel_NormalVsTumor_3miRNA_6plots.png")
+  png(out_panel, width = 5400, height = 3600, res = 300)
+  print(panel_combined)
+  dev.off()
+  cat("  Saved:", out_panel, "\n")
+}
+
+# ==============================================================================
+# PART 8B — Pooled (LUAD + LUSC) 3-panel figure
+# ==============================================================================
+
+cat("\n── Part 8B: Pooled 3-panel figure (LUAD+LUSC combined) ──\n")
+
+pooled_panel_list <- list()
+
+for (mir in SIG$mature_name) {
+
+  df_sub <- long_df %>%
+    filter(cohort == "LUAD+LUSC (Pooled)", mature_name == mir)
+
+  if (nrow(df_sub) < 5) next
+
+  wt_row  <- wilcox_results %>%
+    filter(cohort == "LUAD+LUSC (Pooled)", mature_name == mir)
+  sig_lbl <- if (nrow(wt_row) == 0) "" else wt_row$significance[1]
+  p_lbl   <- if (nrow(wt_row) == 0) "" else
+    paste0("p.adj = ", wt_row$p_adj_BH[1], "  ", sig_lbl)
+
+  n_labs <- df_sub %>%
+    group_by(tissue_type) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    mutate(x_lab = paste0(tissue_type, "\n(n=", n, ")")) %>%
+    { setNames(.$x_lab, .$tissue_type) }
+
+  df_sub <- df_sub %>%
+    mutate(x_lab = factor(n_labs[as.character(tissue_type)],
+                          levels = n_labs[c("Normal", "Tumor")]))
+
+  y_top <- max(df_sub$log2_expr, na.rm = TRUE)
+
+  p_pool <- ggplot(df_sub,
+                   aes(x = x_lab, y = log2_expr, fill = tissue_type)) +
+    geom_violin(trim = FALSE, alpha = 0.50, linewidth = 0.35) +
+    geom_boxplot(width = 0.15, outlier.size = 0.6,
+                 outlier.alpha = 0.35, linewidth = 0.45,
+                 fill = "white", alpha = 0.85) +
+    annotate("text", x = 1.5, y = y_top * 1.10,
+             label = p_lbl, size = 2.8,
+             color = "grey25", fontface = "italic") +
+    scale_fill_manual(values = TISSUE_PAL) +
+    labs(
+      title    = "LUAD+LUSC (Pooled)",
+      subtitle = mir,
+      x        = NULL,
+      y        = "log2(RPM + 1)"
+    ) +
+    theme_bw(base_size = 9) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 9),
+      plot.subtitle    = element_text(size = 8, color = "grey20", face = "italic"),
+      legend.position  = "none",
+      panel.grid.minor = element_blank(),
+      axis.text        = element_text(size = 8)
+    )
+
+  pooled_panel_list[[mir]] <- p_pool
+}
+
+pooled_panel_list <- Filter(Negate(is.null), pooled_panel_list)
+
+if (length(pooled_panel_list) >= 1) {
+  pooled_panel <- wrap_plots(pooled_panel_list, ncol = 3) +
+    plot_annotation(
+      title    = "Baseline Expression: Normal vs Tumor — 3-miRNA Signature (Pooled LUAD+LUSC)",
+      subtitle = "log2(RPM + 1) · Wilcoxon rank-sum · BH-adjusted p-value · TCGA-LUAD + TCGA-LUSC combined",
+      theme    = theme(
+        plot.title    = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(color = "grey35", size = 10)
+      )
+    )
+
+  out_pool <- file.path(OUT_DIR, "Panel_NormalVsTumor_3miRNA_Pooled.png")
+  png(out_pool, width = 5400, height = 2000, res = 300)
+  print(pooled_panel)
+  dev.off()
+  cat("  Saved:", out_pool, "\n")
+}
+
+# ==============================================================================
+# PART 8C — 9-panel mega figure (3 miRNAs × 3 cohorts: LUAD / LUSC / Pooled)
+# ==============================================================================
+
+cat("\n── Part 8C: 9-panel mega figure (3 miRNAs × 3 cohorts) ──\n")
+
+# Build a helper function so we can reuse clean panel code
+make_panel_plot <- function(df_sub, title_str, subtitle_str, p_lbl, y_top) {
+  ggplot(df_sub,
+         aes(x = x_lab, y = log2_expr, fill = tissue_type)) +
+    geom_violin(trim = FALSE, alpha = 0.50, linewidth = 0.35) +
+    geom_boxplot(width = 0.15, outlier.size = 0.6,
+                 outlier.alpha = 0.35, linewidth = 0.45,
+                 fill = "white", alpha = 0.85) +
+    annotate("text", x = 1.5, y = y_top * 1.10,
+             label = p_lbl, size = 2.6, color = "grey25", fontface = "italic") +
+    scale_fill_manual(values = TISSUE_PAL) +
+    labs(title = title_str, subtitle = subtitle_str,
+         x = NULL, y = "log2(RPM + 1)") +
+    theme_bw(base_size = 9) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 9),
+      plot.subtitle    = element_text(size = 7.5, color = "grey20", face = "italic"),
+      legend.position  = "none",
+      panel.grid.minor = element_blank(),
+      axis.text        = element_text(size = 7.5)
+    )
+}
+
+# Cohort display order: LUAD | LUSC | Pooled (rows), miRNA (columns)
+COHORT_ORDER <- c("TCGA-LUAD", "TCGA-LUSC", "LUAD+LUSC (Pooled)")
+mega_list    <- list()
+
+for (mir in SIG$mature_name) {
+  for (coh in COHORT_ORDER) {
+
+    df_sub <- long_df %>%
+      filter(cohort == coh, mature_name == mir)
+
+    if (nrow(df_sub) < 5) {
+      mega_list[[paste(mir, coh)]] <- NULL
+      next
+    }
+
+    wt_row  <- wilcox_results %>%
+      filter(cohort == coh, mature_name == mir)
+    sig_lbl <- if (nrow(wt_row) == 0) "" else wt_row$significance[1]
+    p_lbl   <- if (nrow(wt_row) == 0) "" else
+      paste0("p.adj=", wt_row$p_adj_BH[1], "  ", sig_lbl)
+
+    n_labs <- df_sub %>%
+      group_by(tissue_type) %>%
+      summarise(n = n(), .groups = "drop") %>%
+      mutate(x_lab = paste0(tissue_type, "\n(n=", n, ")")) %>%
+      { setNames(.$x_lab, .$tissue_type) }
+
+    df_sub <- df_sub %>%
+      mutate(x_lab = factor(n_labs[as.character(tissue_type)],
+                            levels = n_labs[c("Normal", "Tumor")]))
+
+    y_top <- max(df_sub$log2_expr, na.rm = TRUE)
+
+    p <- make_panel_plot(df_sub,
+                         title_str    = coh,
+                         subtitle_str = mir,
+                         p_lbl        = p_lbl,
+                         y_top        = y_top)
+
+    mega_list[[paste(mir, coh)]] <- p
+  }
+}
+
+mega_list <- Filter(Negate(is.null), mega_list)
+
+if (length(mega_list) >= 2) {
+  # Layout: columns = cohorts (3), rows = miRNAs (3) → ncol = 3
+  mega_panel <- wrap_plots(mega_list, ncol = 3) +
+    plot_annotation(
+      title    = "Baseline miRNA Expression: Normal vs Tumor — 3-miRNA Signature",
+      subtitle = paste0("log2(RPM + 1)  ·  Wilcoxon rank-sum  ·  BH-adjusted p-value\n",
+                        "Columns: TCGA-LUAD  |  TCGA-LUSC  |  LUAD+LUSC Pooled",
+                        "     Rows: hsa-miR-509-3p  |  hsa-miR-377-3p  |  hsa-miR-378h"),
+      theme    = theme(
+        plot.title    = element_text(face = "bold", size = 15),
+        plot.subtitle = element_text(color = "grey35", size = 9.5)
+      )
+    )
+
+  out_mega <- file.path(OUT_DIR, "Panel_NormalVsTumor_3miRNA_9plots_AllCohorts.png")
+  png(out_mega, width = 5400, height = 5400, res = 300)
+  print(mega_panel)
+  dev.off()
+  cat("  Saved:", out_mega, "\n")
+}
+
+# ==============================================================================
+# PART 9 — Paired analysis (matched normal-tumor, same patient)
+# ==============================================================================
+
+cat("\n── Part 9: Paired analysis (matched cases) ──\n")
+
+paired_stats <- long_df %>%
+  group_by(cohort, mature_name) %>%
+  summarise({
+    pivot_w <- cur_data() %>%
+      select(case_id, tissue_type, log2_expr) %>%
+      pivot_wider(names_from = tissue_type, values_from = log2_expr)
+
+    paired_df <- pivot_w %>%
+      filter(!is.na(Normal), !is.na(Tumor))
+
+    if (nrow(paired_df) < MIN_N_GROUP) {
+      tibble(
+        n_pairs        = nrow(paired_df),
+        median_delta   = NA_real_,
+        mean_delta     = NA_real_,
+        p_paired_wilcox = NA_real_,
+        significance   = "Insufficient pairs"
+      )
+    } else {
+      delta <- paired_df$Tumor - paired_df$Normal
+      pw    <- wilcox.test(paired_df$Tumor, paired_df$Normal,
+                           paired = TRUE, exact = FALSE)
+      tibble(
+        n_pairs         = nrow(paired_df),
+        median_delta    = round(median(delta), 4),  # Tumor − Normal
+        mean_delta      = round(mean(delta),   4),
+        p_paired_wilcox = pw$p.value,
+        significance    = case_when(
+          pw$p.value < 0.001 ~ "***",
+          pw$p.value < 0.01  ~ "**",
+          pw$p.value < 0.05  ~ "*",
+          TRUE               ~ "ns"
+        )
+      )
+    }
+  }, .groups = "drop")
+
+cat("\n═══ Paired Analysis Summary (Tumor − Normal, same patient) ═══\n")
+print(paired_stats, n = 20)
+
+write.csv(paired_stats,
+          file.path(OUT_DIR, "Paired_NormalVsTumor.csv"),
+          row.names = FALSE)
+cat("✓ Saved: Paired_NormalVsTumor.csv\n")
+
+# ==============================================================================
+# PART 10 — Paired dot plot (only cohorts with matched normals)
+# ==============================================================================
+
+cat("\n── Part 10: Paired dot plots ──\n")
+
+for (coh in c("TCGA-LUAD", "TCGA-LUSC", "LUAD+LUSC (Pooled)")) {
+  for (mir in SIG$mature_name) {
+
+    df_sub <- long_df %>%
+      filter(cohort == coh, mature_name == mir) %>%
+      select(case_id, tissue_type, log2_expr)
+
+    pivot_w <- df_sub %>%
+      pivot_wider(names_from = tissue_type, values_from = log2_expr) %>%
+      filter(!is.na(Normal), !is.na(Tumor))
+
+    if (nrow(pivot_w) < MIN_N_GROUP) {
+      cat("  [SKIP paired]", coh, mir,
+          "— only", nrow(pivot_w), "matched pairs\n")
+      next
+    }
+
+    cat("  ", coh, mir, "—", nrow(pivot_w), "matched pairs\n")
+
+    pivot_long <- pivot_w %>%
+      pivot_longer(c("Normal", "Tumor"),
+                   names_to  = "tissue_type",
+                   values_to = "log2_expr") %>%
+      mutate(tissue_type = factor(tissue_type, levels = c("Normal", "Tumor")))
+
+    pw_p <- wilcox.test(pivot_w$Tumor, pivot_w$Normal,
+                        paired = TRUE, exact = FALSE)$p.value
+    p_lbl <- ifelse(pw_p < 0.001, "p < 0.001",
+                    paste0("p = ", formatC(pw_p, digits = 3, format = "g")))
+
+    y_range <- range(pivot_long$log2_expr, na.rm = TRUE)
+    y_ann   <- y_range[2] + diff(y_range) * 0.10
+
+    p_paired <- ggplot(pivot_long,
+                       aes(x = tissue_type, y = log2_expr,
+                           group = case_id)) +
+      geom_line(alpha = 0.25, linewidth = 0.3, color = "grey50") +
+      geom_point(aes(color = tissue_type), size = 1.4, alpha = 0.65) +
+      stat_summary(fun = median, geom = "crossbar",
+                   width = 0.35, linewidth = 0.8,
+                   aes(group = 1, color = tissue_type), show.legend = FALSE) +
+      annotate("text", x = 1.5, y = y_ann,
+               label = paste0("Paired Wilcoxon\n", p_lbl,
+                               "\nn pairs = ", nrow(pivot_w)),
+               size = 3, color = "grey25", fontface = "italic",
+               hjust = 0.5) +
+      scale_color_manual(values = TISSUE_PAL) +
+      labs(
+        title    = paste0(coh, " — ", mir),
+        subtitle = "Paired normal–tumor (same patient)  |  Median crossbar",
+        x        = "Tissue Type",
+        y        = "Expression  [log2(RPM + 1)]"
+      ) +
+      base_theme
+
+    mir_safe <- gsub("[^A-Za-z0-9]", "_", mir)
+    coh_safe <- gsub("-", "_", coh)
+    out_p    <- file.path(OUT_DIR,
+                          paste0("Paired_", coh_safe, "_", mir_safe, ".png"))
+    png(out_p, width = 1800, height = 2000, res = 300)
+    print(p_paired)
+    dev.off()
+    cat("    Saved:", out_p, "\n")
+  }
+}
+
+# ==============================================================================
+# PART 11 — Zero-expression rate summary (platform dropout check)
+# ==============================================================================
+
+cat("\n── Part 11: Zero-expression rate (platform dropout check) ──\n")
+
+zero_rate <- long_df %>%
+  group_by(cohort, mature_name, tissue_type) %>%
+  summarise(
+    n          = n(),
+    n_zero     = sum(log2_expr == 0, na.rm = TRUE),
+    zero_pct   = round(100 * mean(log2_expr == 0, na.rm = TRUE), 1),
+    flag       = ifelse(zero_pct >= 80,
+                        "⚠ PLATFORM DROPOUT (≥80% zero)", "OK"),
+    .groups    = "drop"
+  )
+
+cat("\n═══ Zero-Expression Rate Summary ═══\n")
+print(zero_rate, n = 30)
+
+write.csv(zero_rate,
+          file.path(OUT_DIR, "ZeroRate_NormalVsTumor.csv"),
+          row.names = FALSE)
+cat("✓ Saved: ZeroRate_NormalVsTumor.csv\n")
+
+# ==============================================================================
+# PART 12 — Final output summary
+# ==============================================================================
+
+cat("\n\n✓ ════════════ ALL DONE ════════════\n")
+cat("Output directory:", OUT_DIR, "\n\n")
+cat("  Plots:\n")
+cat("  Violin_NvT_TCGA_LUAD.png                        — violin+box, LUAD only\n")
+cat("  Violin_NvT_TCGA_LUSC.png                        — violin+box, LUSC only\n")
+cat("  Violin_NvT_LUAD_LUSC__Pooled_.png               — violin+box, Pooled\n")
+cat("  Panel_NormalVsTumor_3miRNA_6plots.png            — 6-panel: 3 miRNAs × LUAD+LUSC\n")
+cat("  Panel_NormalVsTumor_3miRNA_Pooled.png            — 3-panel: 3 miRNAs, Pooled only\n")
+cat("  Panel_NormalVsTumor_3miRNA_9plots_AllCohorts.png — 9-panel: 3 miRNAs × 3 cohorts\n")
+cat("  Paired_<cohort>_<miRNA>.png                      — paired dot plots (matched cases)\n\n")
+cat("  CSV outputs:\n")
+cat("  Descriptive_Stats_NormalVsTumor.csv   — mean, median, SD, zero% (all cohorts)\n")
+cat("  Wilcoxon_NormalVsTumor.csv            — Wilcoxon W, p, p.adj BH (all cohorts)\n")
+cat("  Paired_NormalVsTumor.csv              — paired Wilcoxon, delta  (all cohorts)\n")
+cat("  ZeroRate_NormalVsTumor.csv            — platform dropout check  (all cohorts)\n")
+```

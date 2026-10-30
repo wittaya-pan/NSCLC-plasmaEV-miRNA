@@ -1,0 +1,1178 @@
+---
+title: "mRNA_NSCLC"
+output: html_notebook
+---
+
+```{r}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(IOBR)
+library(ggplot2)
+library(ggpubr)
+library(tidyr)
+library(patchwork)
+library(pheatmap)
+library(tibble)
+
+# Force dplyr functions to take priority
+library(conflicted)
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("rename", "dplyr")
+conflict_prefer("intersect", "base"); conflict_prefer("setdiff", "base"); conflict_prefer("union", "base")
+
+# ── Step 2: Verify LM22 is available ─────────────────────────────────────
+# Check if LM22 loads correctly
+tryCatch({
+  lm22_test <- get("lm22", envir = asNamespace("IOBR"))
+  cat("LM22 loaded successfully:", nrow(lm22_test), "genes x",
+      ncol(lm22_test), "cell types\n")
+}, error = function(e) {
+  cat("LM22 still not found — trying manual load\n")
+})
+library(IOBR)
+#BiocManager::install("IOBR/IOBR")
+# ── Manual LM22 fix ───────────────────────────────────────────────────────
+# Download LM22 from GitHub directly
+lm22_url <- "https://raw.githubusercontent.com/IOBR/IOBR/master/data/lm22.rda"
+if (!file.exists("lm22.rda")) download.file(lm22_url, destfile = "lm22.rda", mode = "wb")
+load("lm22.rda")
+
+# Inject into IOBR namespace
+# (older IOBR versions only; IOBR >= 2.x loads LM22 itself via load_data("lm22"))
+if (exists("lm22", envir = asNamespace("IOBR"), inherits = FALSE)) assignInNamespace("lm22", lm22, ns = "IOBR")
+
+# Verify
+cat("LM22 dimensions:", nrow(lm22), "genes x", ncol(lm22), "cell types\n")
+print(colnames(lm22))
+
+# ── 1. Load risk scores ───────────────────────────────────────────────────
+luad <- read.csv("TCGA_LUAD_risk_scores_3mir.csv")
+lusc <- read.csv("TCGA_LUSC_risk_scores_3mir.csv")
+
+# Combine LUAD + LUSC
+nsclc_risk <- bind_rows(
+  luad %>% mutate(cancer_type = "LUAD"),
+  lusc %>% mutate(cancer_type = "LUSC")
+)
+
+cat("Total NSCLC patients:", nrow(nsclc_risk), "\n")
+cat("High:", sum(nsclc_risk$RiskGroup == "High"),
+    "Low:", sum(nsclc_risk$RiskGroup == "Low"), "\n")
+
+# ── 2. Download LUAD mRNA (first run only) ────────────────────────────────
+if (!file.exists("TCGA_LUAD_mrna.rds")) {
+query_luad_mrna <- GDCquery(
+  project       = "TCGA-LUAD",
+  data.category = "Transcriptome Profiling",
+  data.type     = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts",
+  sample.type   = "Primary Tumor"
+)
+GDCdownload(query_luad_mrna)
+luad_mrna <- GDCprepare(query_luad_mrna)
+saveRDS(luad_mrna, "TCGA_LUAD_mrna.rds")
+}
+
+# ── 3. Download LUSC mRNA (first run only) ────────────────────────────────
+if (!file.exists("TCGA_LUSC_mrna.rds")) {
+query_lusc_mrna <- GDCquery(
+  project       = "TCGA-LUSC",
+  data.category = "Transcriptome Profiling",
+  data.type     = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts",
+  sample.type   = "Primary Tumor"
+)
+GDCdownload(query_lusc_mrna)
+lusc_mrna <- GDCprepare(query_lusc_mrna)
+saveRDS(lusc_mrna, "TCGA_LUSC_mrna.rds")
+}
+
+# ── Load pre-downloaded TCGA mRNA data ────────────────────────────────────
+luad_mrna <- readRDS("TCGA_LUAD_mrna.rds")
+lusc_mrna <- readRDS("TCGA_LUSC_mrna.rds")
+
+# ── 4. Extract TPM + convert to gene symbol ───────────────────────────────
+convert_to_symbol <- function(se, assay_name = "tpm_unstrand") {
+  cat("Available assays:", assayNames(se), "\n")
+  tpm_mat    <- assay(se, assay_name)
+  gene_info  <- as.data.frame(rowData(se))
+  symbol_col <- grep("gene_name|gene_symbol",
+                      names(gene_info), ignore.case = TRUE, value = TRUE)[1]
+  rownames(tpm_mat) <- gene_info[[symbol_col]]
+  tpm_df     <- as.data.frame(tpm_mat)
+  tpm_df     <- tpm_df[!duplicated(rownames(tpm_df)) &
+                         !is.na(rownames(tpm_df)) &
+                         rownames(tpm_df) != "", ]
+  return(as.matrix(tpm_df))
+}
+
+luad_tpm <- convert_to_symbol(luad_mrna)
+lusc_tpm <- convert_to_symbol(lusc_mrna)
+
+# ── 5. Combine mRNA matrices ──────────────────────────────────────────────
+common_genes <- intersect(rownames(luad_tpm), rownames(lusc_tpm))
+nsclc_tpm    <- cbind(luad_tpm[common_genes, ],
+                       lusc_tpm[common_genes, ])
+
+cat("Combined mRNA:", nrow(nsclc_tpm), "genes x", ncol(nsclc_tpm), "samples\n")
+
+# ── 6. Match mRNA samples to risk score using 12-char case ID ─────────────
+col_case12    <- substr(colnames(nsclc_tpm), 1, 12)
+matched_idx   <- col_case12 %in% nsclc_risk$case_id
+nsclc_tpm_matched <- nsclc_tpm[, matched_idx]
+
+# Align risk_df to matched sample order
+matched_case12    <- col_case12[matched_idx]
+risk_matched      <- nsclc_risk[match(matched_case12, nsclc_risk$case_id), ]
+
+cat("Matched samples:", ncol(nsclc_tpm_matched), "\n")
+cat("High:", sum(risk_matched$RiskGroup == "High"),
+    "Low:", sum(risk_matched$RiskGroup == "Low"), "\n")
+
+# ── 7. Run CIBERSORT ──────────────────────────────────────────────────────
+cibersort_res <- deconvo_tme(
+  eset    = nsclc_tpm_matched,
+  method  = "cibersort",
+  arrays  = FALSE,
+  perm    = 100
+)
+
+write.csv(cibersort_res, "CIBERSORT_raw_results.csv", row.names = FALSE)
+cat("CIBERSORT complete:", nrow(cibersort_res), "samples\n")
+
+# ── 8. Merge CIBERSORT with risk groups ───────────────────────────────────
+cibersort_res$case_id <- substr(cibersort_res$ID, 1, 12)
+
+merged <- merge(cibersort_res,
+                risk_matched[, c("case_id", "RiskGroup", "cancer_type")],
+                by = "case_id")
+
+write.csv(merged, "CIBERSORT_with_riskgroup.csv", row.names = FALSE)
+cat("Merged samples:", nrow(merged), "\n")
+
+# ── 9. Get immune cell columns ────────────────────────────────────────────
+immune_cols <- grep("CIBERSORT", names(cibersort_res), value = TRUE)
+immune_cols <- immune_cols[!immune_cols %in% 
+                             c("CIBERSORT_P_value", 
+                               "CIBERSORT_Correlation",
+                               "CIBERSORT_RMSE")]
+cat("Immune cell types detected:", length(immune_cols), "\n")
+
+# ── 10. Wilcoxon test per cell type ───────────────────────────────────────
+wilcox_results <- lapply(immune_cols, function(cell) {
+  high_vals <- merged[[cell]][merged$RiskGroup == "High"]
+  low_vals  <- merged[[cell]][merged$RiskGroup == "Low"]
+  test      <- wilcox.test(high_vals, low_vals)
+  data.frame(
+    Cell_Type  = gsub("CIBERSORT_", "", cell),
+    p_value    = test$p.value,
+    mean_High  = mean(high_vals),
+    mean_Low   = mean(low_vals)
+  )
+})
+
+
+wilcox_df <- do.call(rbind, wilcox_results) %>%
+  mutate(
+    p_adj       = p.adjust(p_value, method = "BH"),
+    Significant = ifelse(p_adj < 0.05, "Yes", "No"),
+    Direction   = ifelse(mean_High > mean_Low, 
+                          "Higher in High", "Higher in Low")
+  ) %>%
+  arrange(p_adj)
+
+# ── Fix Cell_Type names in wilcox_df to match immune_long ─────────────────
+wilcox_df$Cell_Type <- gsub("_", " ", wilcox_df$Cell_Type)
+
+# ── Define plot cells ─────────────────────────────────────────────────────
+sig_cells  <- wilcox_df$Cell_Type[wilcox_df$p_adj < 0.05]
+top8_cells <- wilcox_df$Cell_Type[1:8]
+
+plot_cells <- if (length(sig_cells) > 0) sig_cells else top8_cells
+plot_title <- if (length(sig_cells) > 0) {
+  "Significant Immune Cell Types — High vs Low Risk (TCGA NSCLC)"
+} else {
+  "Top 8 Immune Cell Types — High vs Low Risk (TCGA NSCLC)"
+}
+
+cat("Plotting", length(plot_cells), "cell types\n")
+
+print(wilcox_df)
+write.csv(wilcox_df, "CIBERSORT_wilcox_results.csv", row.names = FALSE)
+
+# ── 11. Long format for plotting ──────────────────────────────────────────
+immune_long <- merged %>%
+  dplyr::select(case_id, RiskGroup, cancer_type, all_of(immune_cols)) %>%
+  pivot_longer(cols      = all_of(immune_cols),
+               names_to  = "Cell_Type",
+               values_to = "Fraction") %>%
+  mutate(Cell_Type = gsub("CIBERSORT_", "", Cell_Type),
+         Cell_Type = gsub("_", " ", Cell_Type))
+
+# ── Plot 11 significant cell types ───────────────────────────────────────
+p_immune <- immune_long %>%
+  dplyr::filter(Cell_Type %in% plot_cells) %>%
+  ggplot(aes(x = RiskGroup, y = Fraction, fill = RiskGroup)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7, width = 0.5) +
+  geom_jitter(width = 0.15, size = 0.8, alpha = 0.4) +
+  stat_compare_means(method = "wilcox.test", label = "p.format", size = 3) +
+  facet_wrap(~Cell_Type, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = c("High" = "#E15759", "Low" = "#4E79A7")) +
+  theme_classic() +
+  labs(title = "Significant Immune Cell Types — High vs Low Risk (TCGA NSCLC)",
+       x = NULL, y = "Cell Fraction") +
+  theme(legend.position = "bottom",
+        strip.text      = element_text(size = 8, face = "bold"),
+        plot.title      = element_text(face = "bold", hjust = 0.5))
+
+print(p_immune)
+ggsave("CIBERSORT_significant_cells.png", p_immune, 
+       width = 14, height = 10, dpi = 300)
+
+# ── Also print full wilcox table for interpretation ───────────────────────
+cat("\n--- All significant cell types (FDR < 0.05) ---\n")
+print(wilcox_df[wilcox_df$p_adj < 0.05, 
+                c("Cell_Type", "p_value", "p_adj", "mean_High", "mean_Low", "Direction")])
+
+# ── 12. Boxplot ───────────────────────────────────────────────────────────
+sig_cells <- wilcox_df$Cell_Type[wilcox_df$p_adj < 0.05]
+
+p_sig <- immune_long %>%
+  dplyr::filter(Cell_Type %in% sig_cells) %>%
+  ggplot(aes(x = RiskGroup, y = Fraction, fill = RiskGroup)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7, width = 0.5) +
+  geom_jitter(width = 0.15, size = 0.8, alpha = 0.4) +
+  stat_compare_means(method = "wilcox.test", label = "p.signif") +
+  facet_wrap(~Cell_Type, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = c("High" = "#E15759", "Low" = "#4E79A7")) +
+  theme_classic() +
+  labs(title = "Significant Immune Cell Differences — High vs Low Risk (TCGA NSCLC)",
+       x = NULL, y = "Cell Fraction") +
+  theme(legend.position = "bottom",
+        strip.text      = element_text(size = 8, face = "bold"),
+        plot.title      = element_text(face = "bold", hjust = 0.5))
+
+print(p_sig)
+ggsave("CIBERSORT_significant_cells.png", p_sig, width = 14, height = 10, dpi = 300)
+
+# ── 13. Heatmap ───────────────────────────────────────────────────────────
+heatmap_data <- merged %>%
+  dplyr::group_by(RiskGroup) %>%
+  dplyr::summarise(across(all_of(immune_cols), mean), .groups = "drop") %>%
+  column_to_rownames("RiskGroup") %>%
+  t()
+
+rownames(heatmap_data) <- gsub("CIBERSORT_", "", rownames(heatmap_data))
+rownames(heatmap_data) <- gsub("_", " ", rownames(heatmap_data))
+
+pheatmap(heatmap_data,
+         scale        = "row",
+         cluster_cols = FALSE,
+         color        = colorRampPalette(c("#4E79A7", "white", "#E15759"))(50),
+         main         = "Immune Cell Fractions — High vs Low Risk (TCGA NSCLC)",
+         fontsize_row = 9,
+         filename     = "CIBERSORT_heatmap.png",
+         width        = 7,
+         height       = 8)
+
+# ── 14. Stacked bar ───────────────────────────────────────────────────────
+stack_data <- immune_long %>%
+  dplyr::group_by(RiskGroup, Cell_Type) %>%
+  dplyr::summarise(mean_fraction = mean(Fraction), .groups = "drop")
+
+p_stack <- ggplot(stack_data,
+                   aes(x = RiskGroup, y = mean_fraction, fill = Cell_Type)) +
+  geom_bar(stat = "identity", position = "fill", width = 0.6) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_classic() +
+  labs(title = "Immune Composition — High vs Low Risk (TCGA NSCLC)",
+       x = "Risk Group", y = "Mean Fraction", fill = "Cell Type") +
+  theme(plot.title      = element_text(face = "bold", hjust = 0.5),
+        legend.text     = element_text(size = 7),
+        legend.key.size = unit(0.4, "cm"))
+
+print(p_stack)
+ggsave("CIBERSORT_composition_bar.png", p_stack, width = 10, height = 7, dpi = 300)
+
+
+
+# ── Save right after deconvo_tme completes ────────────────────────────────
+saveRDS(cibersort_res, "CIBERSORT_raw_results.rds")
+write.csv(cibersort_res, "CIBERSORT_raw_results.csv", row.names = FALSE)
+
+# Also save the merged object
+saveRDS(merged, "CIBERSORT_merged.rds")
+write.csv(merged, "CIBERSORT_merged.csv", row.names = FALSE)
+
+cat("Saved successfully\n")
+```
+#seperate LUAD and LUSC
+```{r}
+library(SummarizedExperiment)
+library(dplyr)
+library(IOBR)
+library(ggplot2)
+library(ggpubr)
+library(tidyr)
+library(pheatmap)
+library(tibble)
+
+# ══════════════════════════════════════════════════════════════════════════
+# SHARED FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════
+
+convert_to_symbol <- function(se, assay_name = "tpm_unstrand") {
+  tpm_mat    <- assay(se, assay_name)
+  gene_info  <- as.data.frame(rowData(se))
+  symbol_col <- grep("gene_name|gene_symbol",
+                      names(gene_info), ignore.case = TRUE, value = TRUE)[1]
+  rownames(tpm_mat) <- gene_info[[symbol_col]]
+  tpm_df <- as.data.frame(tpm_mat)
+  tpm_df <- tpm_df[!duplicated(rownames(tpm_df)) &
+                     !is.na(rownames(tpm_df)) &
+                     rownames(tpm_df) != "", ]
+  return(as.matrix(tpm_df))
+}
+
+match_samples <- function(tpm_mat, risk_df) {
+  col_case12   <- substr(colnames(tpm_mat), 1, 12)
+  matched_idx  <- col_case12 %in% risk_df$case_id
+  tpm_matched  <- tpm_mat[, matched_idx]
+  risk_matched <- risk_df[match(col_case12[matched_idx], risk_df$case_id), ]
+  cat("Matched samples:", ncol(tpm_matched), "\n")
+  cat("High:", sum(risk_matched$RiskGroup == "High"),
+      "Low:",  sum(risk_matched$RiskGroup == "Low"), "\n")
+  return(list(tpm = tpm_matched, risk = risk_matched))
+}
+
+run_wilcox <- function(merged, immune_cols, label) {
+  results <- lapply(immune_cols, function(cell) {
+    high_vals <- merged[[cell]][merged$RiskGroup == "High"]
+    low_vals  <- merged[[cell]][merged$RiskGroup == "Low"]
+    test      <- wilcox.test(high_vals, low_vals)
+    data.frame(
+      Cell_Type = cell,
+      p_value   = test$p.value,
+      mean_High = mean(high_vals),
+      mean_Low  = mean(low_vals)
+    )
+  })
+  df <- do.call(rbind, results) %>%
+    dplyr::mutate(
+      p_adj       = p.adjust(p_value, method = "BH"),
+      Significant = ifelse(p_adj < 0.05, "Yes", "No"),
+      Direction   = ifelse(mean_High > mean_Low,
+                            "Higher in High", "Higher in Low")
+    ) %>%
+    dplyr::arrange(p_adj)
+
+  # Clean names after stats
+  df$Cell_Type <- gsub("_", " ", df$Cell_Type)
+
+  write.csv(df, paste0("CIBERSORT_wilcox_", label, ".csv"), row.names = FALSE)
+  cat("\n--- Significant cell types (FDR<0.05):", label, "---\n")
+  print(df[df$p_adj < 0.05,
+           c("Cell_Type", "p_value", "p_adj", "mean_High", "mean_Low", "Direction")])
+  return(df)
+}
+
+make_all_plots <- function(merged, wilcox_df, immune_cols, label) {
+
+  # Long format
+  immune_long <- merged %>%
+    dplyr::select(case_id, RiskGroup, all_of(immune_cols)) %>%
+    tidyr::pivot_longer(cols      = all_of(immune_cols),
+                        names_to  = "Cell_Type",
+                        values_to = "Fraction") %>%
+    dplyr::mutate(Cell_Type = gsub("_", " ", Cell_Type))
+
+  risk_colors <- c("High" = "#E15759", "Low" = "#4E79A7")
+
+  # --- Boxplot ---
+  sig_cells  <- wilcox_df$Cell_Type[wilcox_df$p_adj < 0.05]
+  plot_cells <- if (length(sig_cells) > 0) sig_cells else wilcox_df$Cell_Type[1:8]
+  plot_title <- if (length(sig_cells) > 0) {
+    paste("Significant Immune Cell Types — High vs Low Risk (TCGA", label, ")")
+  } else {
+    paste("Top 8 Immune Cell Types — High vs Low Risk (TCGA", label, ")")
+  }
+
+  p_box <- immune_long %>%
+    dplyr::filter(Cell_Type %in% plot_cells) %>%
+    ggplot(aes(x = RiskGroup, y = Fraction, fill = RiskGroup)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.7, width = 0.5) +
+    geom_jitter(width = 0.15, size = 0.8, alpha = 0.4) +
+    stat_compare_means(method = "wilcox.test", label = "p.signif", size = 3) +
+    facet_wrap(~Cell_Type, scales = "free_y", ncol = 4) +
+    scale_fill_manual(values = risk_colors) +
+    theme_classic() +
+    labs(title = plot_title, x = NULL, y = "Cell Fraction") +
+    theme(legend.position = "bottom",
+          strip.text      = element_text(size = 8, face = "bold"),
+          plot.title      = element_text(face = "bold", hjust = 0.5))
+
+  print(p_box)
+  ggsave(paste0("CIBERSORT_boxplot_", label, ".png"),
+         p_box, width = 14, height = 10, dpi = 300)
+
+  # --- Heatmap ---
+  heatmap_data <- merged %>%
+    dplyr::group_by(RiskGroup) %>%
+    dplyr::summarise(across(all_of(immune_cols), mean), .groups = "drop") %>%
+    column_to_rownames("RiskGroup") %>%
+    t()
+
+  rownames(heatmap_data) <- gsub("_", " ", rownames(heatmap_data))
+
+  pheatmap(heatmap_data,
+           scale        = "row",
+           cluster_cols = FALSE,
+           color        = colorRampPalette(c("#4E79A7", "white", "#E15759"))(50),
+           main         = paste("Immune Cell Fractions — High vs Low Risk (TCGA", label, ")"),
+           fontsize_row = 9,
+           filename     = paste0("CIBERSORT_heatmap_", label, ".png"),
+           width = 7, height = 8)
+
+  # --- Stacked bar ---
+  stack_data <- immune_long %>%
+    dplyr::group_by(RiskGroup, Cell_Type) %>%
+    dplyr::summarise(mean_fraction = mean(Fraction), .groups = "drop")
+
+  p_stack <- ggplot(stack_data,
+                     aes(x = RiskGroup, y = mean_fraction, fill = Cell_Type)) +
+    geom_bar(stat = "identity", position = "fill", width = 0.6) +
+    scale_y_continuous(labels = scales::percent) +
+    theme_classic() +
+    labs(title = paste("Immune Composition — High vs Low Risk (TCGA", label, ")"),
+         x = "Risk Group", y = "Mean Fraction", fill = "Cell Type") +
+    theme(plot.title      = element_text(face = "bold", hjust = 0.5),
+          legend.text     = element_text(size = 7),
+          legend.key.size = unit(0.4, "cm"))
+
+  print(p_stack)
+  ggsave(paste0("CIBERSORT_stackbar_", label, ".png"),
+         p_stack, width = 10, height = 7, dpi = 300)
+
+  cat("All plots saved for", label, "\n")
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# LUAD
+# ══════════════════════════════════════════════════════════════════════════
+cat("\n========== LUAD ==========\n")
+
+luad_mrna <- readRDS("TCGA_LUAD_mrna.rds")
+luad_risk <- read.csv("TCGA_LUAD_risk_scores_3mir.csv")
+
+luad_tpm     <- convert_to_symbol(luad_mrna)
+luad_matched <- match_samples(luad_tpm, luad_risk)
+
+# Run CIBERSORT
+luad_cib_res <- deconvo_tme(
+  eset   = luad_matched$tpm,
+  method = "cibersort",
+  arrays = FALSE,
+  perm   = 100
+)
+
+# Save immediately
+saveRDS(luad_cib_res, "CIBERSORT_raw_LUAD.rds")
+write.csv(luad_cib_res, "CIBERSORT_raw_LUAD.csv", row.names = FALSE)
+cat("CIBERSORT LUAD saved\n")
+
+# Merge with risk group
+luad_cib_res$case_id <- substr(luad_cib_res$ID, 1, 12)
+luad_merged <- merge(luad_cib_res,
+                      luad_matched$risk[, c("case_id", "RiskGroup")],
+                      by = "case_id")
+
+saveRDS(luad_merged, "CIBERSORT_merged_LUAD.rds")
+write.csv(luad_merged, "CIBERSORT_merged_LUAD.csv", row.names = FALSE)
+
+# Get immune cols
+immune_cols_luad <- grep("CIBERSORT", names(luad_cib_res), value = TRUE)
+immune_cols_luad <- immune_cols_luad[!immune_cols_luad %in%
+                                       c("CIBERSORT_P_value",
+                                         "CIBERSORT_Correlation",
+                                         "CIBERSORT_RMSE")]
+
+# Wilcox + plots
+luad_wilcox <- run_wilcox(luad_merged, immune_cols_luad, "LUAD")
+make_all_plots <- function(merged, wilcox_df, immune_cols, label) {
+
+  # Long format
+  immune_long <- merged %>%
+    dplyr::select(case_id, RiskGroup, all_of(immune_cols)) %>%
+    tidyr::pivot_longer(cols      = all_of(immune_cols),
+                        names_to  = "Cell_Type",
+                        values_to = "Fraction") %>%
+    dplyr::mutate(Cell_Type = gsub("_", " ", Cell_Type))
+
+  risk_colors <- c("High" = "#E15759", "Low" = "#4E79A7")
+
+  # --- Boxplot ---
+  sig_cells  <- wilcox_df$Cell_Type[wilcox_df$p_adj < 0.05]
+  plot_cells <- if (length(sig_cells) > 0) sig_cells else wilcox_df$Cell_Type[1:8]
+  plot_title <- if (length(sig_cells) > 0) {
+    paste("Significant Immune Cell Types — High vs Low Risk (TCGA", label, ")")
+  } else {
+    paste("Top 8 Immune Cell Types (nominal p) — High vs Low Risk (TCGA", label, ")")
+  }
+
+  p_box <- immune_long %>%
+    dplyr::filter(Cell_Type %in% plot_cells) %>%
+    ggplot(aes(x = RiskGroup, y = Fraction, fill = RiskGroup)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.7, width = 0.5) +
+    geom_jitter(width = 0.15, size = 0.8, alpha = 0.4) +
+    stat_compare_means(method = "wilcox.test", label = "p.format", size = 3) +
+    facet_wrap(~Cell_Type, scales = "free_y", ncol = 4) +
+    scale_fill_manual(values = risk_colors) +
+    theme_classic() +
+    labs(title = plot_title, x = NULL, y = "Cell Fraction") +
+    theme(legend.position = "bottom",
+          strip.text      = element_text(size = 8, face = "bold"),
+          plot.title      = element_text(face = "bold", hjust = 0.5))
+
+  print(p_box)
+  ggsave(paste0("CIBERSORT_boxplot_", label, ".png"),
+         p_box, width = 14, height = 10, dpi = 300)
+
+  # --- Heatmap ---
+  heatmap_data <- merged %>%
+    dplyr::group_by(RiskGroup) %>%
+    dplyr::summarise(across(all_of(immune_cols), mean), .groups = "drop") %>%
+    column_to_rownames("RiskGroup") %>%
+    t()
+
+  rownames(heatmap_data) <- gsub("_", " ", rownames(heatmap_data))
+
+  # ── Fix: remove rows with zero variance (cause NA after scaling) ─────────
+  row_sd <- apply(heatmap_data, 1, sd)
+  heatmap_data <- heatmap_data[row_sd > 0, ]
+  cat("Rows removed due to zero variance:", sum(row_sd == 0), "\n")
+  cat("Rows remaining for heatmap:", nrow(heatmap_data), "\n")
+
+  # ── Fix: remove any remaining NA/Inf rows ────────────────────────────────
+  heatmap_data <- heatmap_data[complete.cases(heatmap_data), ]
+  heatmap_data <- heatmap_data[!apply(heatmap_data, 1, function(x) any(is.infinite(x))), ]
+
+  pheatmap(heatmap_data,
+           scale        = "row",
+           cluster_cols = FALSE,
+           color        = colorRampPalette(c("#4E79A7", "white", "#E15759"))(50),
+           main         = paste("Immune Cell Fractions — High vs Low Risk (TCGA", label, ")"),
+           fontsize_row = 9,
+           filename     = paste0("CIBERSORT_heatmap_", label, ".png"),
+           width = 7, height = 8)
+
+  # --- Stacked bar ---
+  stack_data <- immune_long %>%
+    dplyr::group_by(RiskGroup, Cell_Type) %>%
+    dplyr::summarise(mean_fraction = mean(Fraction), .groups = "drop")
+
+  p_stack <- ggplot(stack_data,
+                     aes(x = RiskGroup, y = mean_fraction, fill = Cell_Type)) +
+    geom_bar(stat = "identity", position = "fill", width = 0.6) +
+    scale_y_continuous(labels = scales::percent) +
+    theme_classic() +
+    labs(title = paste("Immune Composition — High vs Low Risk (TCGA", label, ")"),
+         x = "Risk Group", y = "Mean Fraction", fill = "Cell Type") +
+    theme(plot.title      = element_text(face = "bold", hjust = 0.5),
+          legend.text     = element_text(size = 7),
+          legend.key.size = unit(0.4, "cm"))
+
+  print(p_stack)
+  ggsave(paste0("CIBERSORT_stackbar_", label, ".png"),
+         p_stack, width = 10, height = 7, dpi = 300)
+
+  cat("All plots saved for", label, "\n")
+}
+
+# ── Re-run for LUAD ───────────────────────────────────────────────────────
+make_all_plots(luad_merged, luad_wilcox, immune_cols_luad, "LUAD")
+```
+
+#LUSC
+```{r}
+
+# ── Step 1: Check if lusc_matched exists ─────────────────────────────────
+if (!exists("lusc_matched")) {
+  cat("lusc_matched not found — rebuilding...\n")
+  
+  lusc_mrna <- readRDS("TCGA_LUSC_mrna.rds")
+  lusc_risk <- read.csv("TCGA_LUSC_risk_scores_3mir.csv")
+  
+  lusc_tpm     <- convert_to_symbol(lusc_mrna)
+  lusc_matched <- match_samples(lusc_tpm, lusc_risk)
+  
+  cat("lusc_matched ready\n")
+} else {
+  cat("lusc_matched already in environment\n")
+}
+
+# ── Step 2: Run CIBERSORT ─────────────────────────────────────────────────
+cat("Running CIBERSORT for LUSC — this will take 20-40 min...\n")
+
+lusc_cib_res <- deconvo_tme(
+  eset   = lusc_matched$tpm,
+  method = "cibersort",
+  arrays = FALSE,
+  perm   = 100
+)
+
+# ── Step 3: Save immediately ──────────────────────────────────────────────
+saveRDS(lusc_cib_res, "CIBERSORT_raw_LUSC.rds")
+write.csv(lusc_cib_res, "CIBERSORT_raw_LUSC.csv", row.names = FALSE)
+cat("CIBERSORT LUSC raw saved\n")
+
+# ── Step 4: Merge with risk group ─────────────────────────────────────────
+lusc_cib_res$case_id <- substr(lusc_cib_res$ID, 1, 12)
+lusc_merged <- merge(lusc_cib_res,
+                      lusc_matched$risk[, c("case_id", "RiskGroup")],
+                      by = "case_id")
+
+saveRDS(lusc_merged, "CIBERSORT_merged_LUSC.rds")
+write.csv(lusc_merged, "CIBERSORT_merged_LUSC.csv", row.names = FALSE)
+cat("CIBERSORT LUSC merged saved\n")
+cat("Samples:", nrow(lusc_merged), "\n")
+cat("High:", sum(lusc_merged$RiskGroup == "High"),
+    "Low:",  sum(lusc_merged$RiskGroup == "Low"), "\n")
+
+# ── Step 5: Wilcox + plots ────────────────────────────────────────────────
+immune_cols_lusc <- grep("CIBERSORT", names(lusc_cib_res), value = TRUE)
+immune_cols_lusc <- immune_cols_lusc[!immune_cols_lusc %in%
+                                       c("CIBERSORT_P_value",
+                                         "CIBERSORT_Correlation",
+                                         "CIBERSORT_RMSE")]
+
+lusc_wilcox <- run_wilcox(lusc_merged, immune_cols_lusc, "LUSC")
+make_all_plots(lusc_merged, lusc_wilcox, immune_cols_lusc, "LUSC")
+```
+
+
+#individual boxplot 
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(tidyr)
+
+# ── Colour palette ────────────────────────────────────────────────────────
+RISK_COLORS <- c("High" = "#E15759", "Low" = "#4E79A7")
+
+# ── Helper: Cell_Type string → column name ────────────────────────────────
+# Cell_Type in wilcox CSVs: "Macrophages M1 CIBERSORT"
+# Column in merged CSV:     "Macrophages_M1_CIBERSORT"
+# Fix: just replace spaces with underscores
+cell_to_col <- function(cell_name) {
+  gsub(" ", "_", cell_name)
+}
+
+# ── Helper: plot one cell type and save PNG ───────────────────────────────
+plot_one_cell <- function(merged_df,
+                          cell_name,
+                          col_name,
+                          title_main,
+                          subtitle_text,
+                          out_path) {
+
+  plot_df <- data.frame(
+    RiskGroup = merged_df$RiskGroup,
+    Fraction  = merged_df[[col_name]]
+  )
+
+  p <- ggplot(plot_df, aes(x = RiskGroup, y = Fraction, fill = RiskGroup)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.75, width = 0.45,
+                 colour = "grey30", linewidth = 0.5) +
+    geom_jitter(width = 0.15, size = 1.2, alpha = 0.45, colour = "grey20") +
+    scale_fill_manual(values = RISK_COLORS) +
+    theme_classic(base_size = 13) +
+    labs(
+      title    = cell_name,
+      subtitle = paste0(title_main,
+                        if (nchar(subtitle_text) > 0)
+                          paste0("   |   ", subtitle_text)
+                        else ""),
+      x = "Risk Group",
+      y = "Cell Fraction"
+    ) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5, size = 13),
+      plot.subtitle   = element_text(hjust = 0.5, size = 9, colour = "grey40"),
+      legend.position = "none",
+      axis.text       = element_text(size = 11)
+    )
+
+  ggsave(out_path, p, width = 4.5, height = 4.8, dpi = 300)
+  invisible(p)
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# 1.  LOAD DATA
+# ══════════════════════════════════════════════════════════════════════════
+pooled_merged <- read.csv("CIBERSORT_merged.csv",          check.names = FALSE)
+pooled_wilcox <- read.csv("CIBERSORT_wilcox_results.csv",  check.names = FALSE)
+luad_merged   <- read.csv("CIBERSORT_merged_LUAD.csv",     check.names = FALSE)
+luad_wilcox   <- read.csv("CIBERSORT_wilcox_LUAD.csv",     check.names = FALSE)
+lusc_merged   <- read.csv("CIBERSORT_merged_LUSC.csv",     check.names = FALSE)
+lusc_wilcox   <- read.csv("CIBERSORT_wilcox_LUSC.csv",     check.names = FALSE)
+
+# Drop any NA rows (seen in LUAD wilcox)
+pooled_wilcox <- pooled_wilcox[!is.na(pooled_wilcox$Cell_Type), ]
+luad_wilcox   <- luad_wilcox  [!is.na(luad_wilcox$Cell_Type),   ]
+lusc_wilcox   <- lusc_wilcox  [!is.na(lusc_wilcox$Cell_Type),   ]
+
+# The 11 significant cells from the pooled run
+pooled_sig_cells <- pooled_wilcox$Cell_Type[pooled_wilcox$p_adj < 0.05]
+luad_sig_cells   <- luad_wilcox$Cell_Type  [luad_wilcox$p_adj   < 0.05]
+lusc_sig_cells   <- lusc_wilcox$Cell_Type  [lusc_wilcox$p_adj   < 0.05]
+
+cat("Pooled sig cells (n =", length(pooled_sig_cells), "):", pooled_sig_cells, "\n")
+cat("LUAD   sig cells (n =", length(luad_sig_cells),   "):", luad_sig_cells,   "\n")
+cat("LUSC   sig cells (n =", length(lusc_sig_cells),   "):", lusc_sig_cells,   "\n")
+
+# ══════════════════════════════════════════════════════════════════════════
+# 2.  OUTPUT DIRECTORIES
+# ══════════════════════════════════════════════════════════════════════════
+dir.create("Output_CIBERSORT_Pooled", showWarnings = FALSE)
+dir.create("Output_CIBERSORT_LUAD",   showWarnings = FALSE)
+dir.create("Output_CIBERSORT_LUSC",   showWarnings = FALSE)
+
+# ══════════════════════════════════════════════════════════════════════════
+# 3.  POOLED NSCLC — one PNG per significant cell
+# ══════════════════════════════════════════════════════════════════════════
+cat("\n--- Plotting Pooled NSCLC ---\n")
+
+for (cell in pooled_sig_cells) {
+  col <- cell_to_col(cell)
+
+  if (!col %in% names(pooled_merged)) {
+    cat("  [SKIP] column not found:", col, "\n")
+    next
+  }
+
+  padj      <- pooled_wilcox$p_adj     [pooled_wilcox$Cell_Type == cell]
+  dir_label <- pooled_wilcox$Direction [pooled_wilcox$Cell_Type == cell]
+  sub_txt   <- sprintf("FDR = %.3f  |  %s Risk", padj,
+                       ifelse(grepl("High", dir_label), "↑ High", "↑ Low"))
+
+  # Remove trailing " CIBERSORT" for a cleaner display title
+  display_name <- sub(" CIBERSORT$", "", cell)
+  safe_name    <- gsub("[^A-Za-z0-9_]", "_", display_name)
+  out_file     <- file.path("Output_CIBERSORT_Pooled",
+                             paste0(safe_name, "_Pooled_NSCLC.png"))
+
+  plot_one_cell(
+    merged_df     = pooled_merged,
+    cell_name     = display_name,
+    col_name      = col,
+    title_main    = "Pooled NSCLC (LUAD + LUSC)",
+    subtitle_text = sub_txt,
+    out_path      = out_file
+  )
+  cat("  Saved:", out_file, "\n")
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# 4.  COHORT-SPECIFIC PLOTS (LUAD / LUSC)
+#     - Plots own FDR < 0.05 cells
+#     - Annotates ★ if also significant in pooled
+#     - Falls back to top 8 nominal-p cells if none pass FDR
+# ══════════════════════════════════════════════════════════════════════════
+plot_cohort <- function(merged_df, wilcox_df, cohort_label, out_dir, pooled_sig) {
+
+  sig_cells  <- wilcox_df$Cell_Type[wilcox_df$p_adj < 0.05]
+  plot_cells <- if (length(sig_cells) > 0) {
+    sig_cells
+  } else {
+    cat("  No FDR<0.05 for", cohort_label, "— using top 8 nominal-p cells\n")
+    wilcox_df$Cell_Type[1:min(8, nrow(wilcox_df))]
+  }
+
+  cat("\n--- Plotting", cohort_label, "(n =", length(plot_cells), "cells) ---\n")
+
+  for (cell in plot_cells) {
+    col <- cell_to_col(cell)
+
+    if (!col %in% names(merged_df)) {
+      cat("  [SKIP] column not found:", col, "\n")
+      next
+    }
+
+    padj      <- wilcox_df$p_adj     [wilcox_df$Cell_Type == cell]
+    dir_label <- wilcox_df$Direction [wilcox_df$Cell_Type == cell]
+
+    sub_txt <- sprintf("FDR = %.3f  |  %s Risk", padj,
+                       ifelse(grepl("High", dir_label), "↑ High", "↑ Low"))
+
+    # Annotate if also significant in pooled NSCLC
+    if (cell %in% pooled_sig) {
+      sub_txt <- paste0(sub_txt, "  |  ★ Also sig. in Pooled NSCLC")
+    }
+
+    display_name <- sub(" CIBERSORT$", "", cell)
+    safe_name    <- gsub("[^A-Za-z0-9_]", "_", display_name)
+    out_file     <- file.path(out_dir, paste0(safe_name, "_", cohort_label, ".png"))
+
+    plot_one_cell(
+      merged_df     = merged_df,
+      cell_name     = display_name,
+      col_name      = col,
+      title_main    = paste0("TCGA-", cohort_label),
+      subtitle_text = sub_txt,
+      out_path      = out_file
+    )
+    cat("  Saved:", out_file, "\n")
+  }
+}
+
+plot_cohort(luad_merged, luad_wilcox, "LUAD",
+            "Output_CIBERSORT_LUAD", pooled_sig_cells)
+
+plot_cohort(lusc_merged, lusc_wilcox, "LUSC",
+            "Output_CIBERSORT_LUSC", pooled_sig_cells)
+
+# ══════════════════════════════════════════════════════════════════════════
+# 5.  CROSS-COHORT OVERLAP SUMMARY TABLE
+# ══════════════════════════════════════════════════════════════════════════
+summary_df <- data.frame(
+  Cell_Type  = pooled_sig_cells,
+  Sig_Pooled = "Yes",
+  Sig_LUAD   = ifelse(pooled_sig_cells %in% luad_sig_cells, "Yes", "No"),
+  Sig_LUSC   = ifelse(pooled_sig_cells %in% lusc_sig_cells, "Yes", "No"),
+  Dir_Pooled = pooled_wilcox$Direction[match(pooled_sig_cells, pooled_wilcox$Cell_Type)],
+  Dir_LUAD   = luad_wilcox$Direction  [match(pooled_sig_cells, luad_wilcox$Cell_Type)],
+  Dir_LUSC   = lusc_wilcox$Direction  [match(pooled_sig_cells, lusc_wilcox$Cell_Type)]
+)
+
+write.csv(summary_df, "CIBERSORT_overlap_summary.csv", row.names = FALSE)
+cat("\n--- Cross-cohort overlap summary ---\n")
+print(summary_df)
+
+# Final file counts
+cat("\n=== OUTPUT FILE COUNTS ===\n")
+for (d in c("Output_CIBERSORT_Pooled", "Output_CIBERSORT_LUAD", "Output_CIBERSORT_LUSC")) {
+  cat(d, "->", length(list.files(d, pattern = "\\.png$")), "PNG files\n")
+}
+```
+
+
+
+#heatmap
+```{r}
+library(dplyr)
+library(tibble)
+library(pheatmap)
+library(RColorBrewer)
+
+# ══════════════════════════════════════════════════════════════════════════
+# 1.  LOAD DATA
+# ══════════════════════════════════════════════════════════════════════════
+pooled_merged <- read.csv("CIBERSORT_merged.csv",         check.names = FALSE)
+pooled_wilcox <- read.csv("CIBERSORT_wilcox_results.csv", check.names = FALSE)
+luad_merged   <- read.csv("CIBERSORT_merged_LUAD.csv",    check.names = FALSE)
+luad_wilcox   <- read.csv("CIBERSORT_wilcox_LUAD.csv",    check.names = FALSE)
+lusc_merged   <- read.csv("CIBERSORT_merged_LUSC.csv",    check.names = FALSE)
+lusc_wilcox   <- read.csv("CIBERSORT_wilcox_LUSC.csv",    check.names = FALSE)
+
+# Drop NA rows
+pooled_wilcox <- pooled_wilcox[!is.na(pooled_wilcox$Cell_Type), ]
+luad_wilcox   <- luad_wilcox  [!is.na(luad_wilcox$Cell_Type),   ]
+lusc_wilcox   <- lusc_wilcox  [!is.na(lusc_wilcox$Cell_Type),   ]
+
+# Significant cell sets — drop NA entries
+pooled_sig <- na.omit(pooled_wilcox$Cell_Type[pooled_wilcox$p_adj < 0.05])
+luad_sig   <- na.omit(luad_wilcox$Cell_Type  [luad_wilcox$p_adj   < 0.05])
+lusc_sig   <- na.omit(lusc_wilcox$Cell_Type  [lusc_wilcox$p_adj   < 0.05])
+
+cat("Pooled sig:", length(pooled_sig), "\n")
+cat("LUAD   sig:", length(luad_sig),   "\n")
+cat("LUSC   sig:", length(lusc_sig),   "\n")
+
+# ══════════════════════════════════════════════════════════════════════════
+# 2.  HELPER FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════
+
+cell_to_col <- function(cell_name) gsub(" ", "_", cell_name)
+
+# Build mean-per-RiskGroup matrix (rows = cells, cols = High / Low)
+build_mean_matrix <- function(merged_df, sig_cells) {
+  cols <- cell_to_col(sig_cells)
+
+  # Verify all columns exist
+  missing <- cols[!cols %in% names(merged_df)]
+  if (length(missing) > 0) {
+    cat("  [WARN] Missing columns:", paste(missing, collapse = ", "), "\n")
+    cols      <- cols[cols %in% names(merged_df)]
+    sig_cells <- sig_cells[cell_to_col(sig_cells) %in% cols]
+  }
+
+  mat <- merged_df %>%
+    dplyr::select(RiskGroup, all_of(cols)) %>%
+    dplyr::group_by(RiskGroup) %>%
+    dplyr::summarise(across(everything(), mean), .groups = "drop") %>%
+    column_to_rownames("RiskGroup") %>%
+    t()                                      # rows = cell types, cols = High/Low
+
+  # Clean row names: remove trailing " CIBERSORT" / "_CIBERSORT"
+  rownames(mat) <- sub("_CIBERSORT$", "", rownames(mat))
+  rownames(mat) <- gsub("_", " ", rownames(mat))
+
+  # Order columns: High then Low
+  mat <- mat[, c("High", "Low"), drop = FALSE]
+
+  return(mat)
+}
+
+# Draw and save a pheatmap
+draw_heatmap <- function(mat, wilcox_df, sig_cells,
+                         title, filename,
+                         width = 7, height = NULL) {
+
+  if (nrow(mat) == 0) {
+    cat("  [SKIP] No rows for heatmap:", title, "\n")
+    return(invisible(NULL))
+  }
+
+  # Auto height: ~0.45 inches per row + 1.5 for margins
+  if (is.null(height)) height <- max(4, nrow(mat) * 0.45 + 2)
+
+  # Row annotation: direction + FDR
+  # Remove NA sig_cells before building annotation
+  sig_cells   <- na.omit(sig_cells)
+  clean_cells <- sub(" CIBERSORT$", "", sig_cells)
+  clean_cells <- gsub("_", " ", clean_cells)
+
+  matched_idx <- match(sig_cells, wilcox_df$Cell_Type)
+
+  row_ann <- data.frame(
+    FDR       = cut(
+      wilcox_df$p_adj[matched_idx],
+      breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+      labels = c("<0.001", "0.001–0.01", "0.01–0.05", "≥0.05")
+    ),
+    row.names = clean_cells
+  )
+
+  # Keep only rows present in matrix (safety) and drop any NA row names
+  row_ann <- row_ann[!is.na(rownames(row_ann)), , drop = FALSE]
+  row_ann <- row_ann[rownames(row_ann) %in% rownames(mat), , drop = FALSE]
+  row_ann <- row_ann[rownames(mat), , drop = FALSE]
+
+  # Annotation colours
+  ann_colors <- list(
+    FDR = c("<0.001"     = "#7B2D8B",
+            "0.001–0.01" = "#C45AB3",
+            "0.01–0.05"  = "#F7B2D9",
+            "≥0.05"      = "grey85")
+  )
+
+  # Column annotation: risk group colour
+  col_ann <- data.frame(
+    RiskGroup = colnames(mat),
+    row.names = colnames(mat)
+  )
+  ann_colors$RiskGroup <- c("High" = "#E15759", "Low" = "#4E79A7")
+
+  pheatmap(
+    mat,
+    scale            = "none",
+    cluster_rows     = TRUE,
+    cluster_cols     = FALSE,
+    annotation_row   = row_ann,
+    annotation_col   = col_ann,
+    annotation_colors = ann_colors,
+    color            = colorRampPalette(
+                         rev(brewer.pal(9, "RdBu")))(100),
+    border_color     = "white",
+    cellwidth        = 45,
+    fontsize_row     = 10,
+    fontsize_col     = 11,
+    main             = title,
+    filename         = filename,
+    width            = width,
+    height           = height
+  )
+
+  cat("  Saved:", filename, "\n")
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# 3.  POOLED NSCLC HEATMAP  (11 cells)
+# ══════════════════════════════════════════════════════════════════════════
+cat("\n--- Pooled NSCLC heatmap ---\n")
+
+mat_pooled <- build_mean_matrix(pooled_merged, pooled_sig)
+
+draw_heatmap(
+  mat       = mat_pooled,
+  wilcox_df = pooled_wilcox,
+  sig_cells = pooled_sig,
+  title     = "Immune Cell Fractions — High vs Low Risk\nPooled NSCLC (LUAD + LUSC)",
+  filename  = "CIBERSORT_heatmap_Pooled_NSCLC.png"
+)
+
+# ══════════════════════════════════════════════════════════════════════════
+# 4.  LUAD HEATMAP  (own FDR < 0.05 cells)
+# ══════════════════════════════════════════════════════════════════════════
+cat("\n--- LUAD heatmap ---\n")
+
+mat_luad <- build_mean_matrix(luad_merged, luad_sig)
+
+draw_heatmap(
+  mat       = mat_luad,
+  wilcox_df = luad_wilcox,
+  sig_cells = luad_sig,
+  title     = "Immune Cell Fractions — High vs Low Risk\nTCGA-LUAD",
+  filename  = "CIBERSORT_heatmap_LUAD.png"
+)
+
+# ══════════════════════════════════════════════════════════════════════════
+# 5.  LUSC HEATMAP  (own FDR < 0.05 cells — Tregs + Macrophages M2)
+# ══════════════════════════════════════════════════════════════════════════
+cat("\n--- LUSC heatmap ---\n")
+
+mat_lusc <- build_mean_matrix(lusc_merged, lusc_sig)
+
+draw_heatmap(
+  mat       = mat_lusc,
+  wilcox_df = lusc_wilcox,
+  sig_cells = lusc_sig,
+  title     = "Immune Cell Fractions — High vs Low Risk\nTCGA-LUSC",
+  filename  = "CIBERSORT_heatmap_LUSC.png",
+  width     = 6.5,
+  height    = 3.5      # only 2 rows, keep compact
+)
+
+cat("\nAll heatmaps done.\n")
+```
+
+#composition
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# ══════════════════════════════════════════════════════════════════════════
+# 1.  LOAD DATA
+# ══════════════════════════════════════════════════════════════════════════
+pooled_merged <- read.csv("CIBERSORT_merged.csv",      check.names = FALSE)
+luad_merged   <- read.csv("CIBERSORT_merged_LUAD.csv", check.names = FALSE)
+lusc_merged   <- read.csv("CIBERSORT_merged_LUSC.csv", check.names = FALSE)
+
+# ── Technical columns to exclude ─────────────────────────────────────────
+TECH_COLS <- c("RMSE_CIBERSORT", "Correlation_CIBERSORT", "P-value_CIBERSORT",
+               # also catch any alternative naming variants
+               "CIBERSORT_RMSE", "CIBERSORT_Correlation", "CIBERSORT_P_value",
+               "P.value_CIBERSORT", "P-value CIBERSORT")
+
+get_immune_cols <- function(df) {
+  cols <- grep("CIBERSORT", names(df), value = TRUE)
+  cols <- cols[!cols %in% TECH_COLS]
+  return(cols)
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# 2.  HELPER: build stacked bar plot
+# ══════════════════════════════════════════════════════════════════════════
+make_composition_plot <- function(merged_df, title, filename,
+                                   width = 9, height = 6) {
+
+  immune_cols <- get_immune_cols(merged_df)
+  cat("Immune cell columns used (n =", length(immune_cols), "):\n")
+  print(immune_cols)
+
+  # Clean cell-type labels: remove _CIBERSORT suffix and underscores
+  clean_labels <- sub("_CIBERSORT$", "", immune_cols)
+  clean_labels <- gsub("_", " ", clean_labels)
+  names(clean_labels) <- immune_cols          # named vector for recode
+
+  # Long format → mean fraction per RiskGroup × Cell_Type
+  stack_data <- merged_df %>%
+    dplyr::select(RiskGroup, all_of(immune_cols)) %>%
+    tidyr::pivot_longer(cols      = all_of(immune_cols),
+                        names_to  = "Cell_Type",
+                        values_to = "Fraction") %>%
+    dplyr::mutate(Cell_Type = dplyr::recode(Cell_Type, !!!clean_labels)) %>%
+    dplyr::group_by(RiskGroup, Cell_Type) %>%
+    dplyr::summarise(mean_fraction = mean(Fraction, na.rm = TRUE),
+                     .groups = "drop")
+
+  # Consistent colour palette (enough colours for 22 cell types)
+  n_cells  <- length(unique(stack_data$Cell_Type))
+  pal_base <- c(
+    "#4E79A7","#F28E2B","#E15759","#76B7B2","#59A14F",
+    "#EDC948","#B07AA1","#FF9DA7","#9C755F","#BAB0AC",
+    "#1F77B4","#AEC7E8","#FFBB78","#2CA02C","#98DF8A",
+    "#D62728","#FF9896","#9467BD","#C5B0D5","#8C564B",
+    "#C49C94","#E377C2"
+  )
+  cell_colors <- setNames(
+    rep(pal_base, length.out = n_cells),
+    sort(unique(stack_data$Cell_Type))
+  )
+
+  p <- ggplot(stack_data,
+              aes(x = RiskGroup, y = mean_fraction, fill = Cell_Type)) +
+    geom_bar(stat = "identity", position = "fill", width = 0.55,
+             colour = "white", linewidth = 0.3) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                       expand = c(0, 0)) +
+    scale_fill_manual(values = cell_colors) +
+    theme_classic(base_size = 13) +
+    labs(
+      title = title,
+      x     = "Risk Group",
+      y     = "Mean Cell Fraction (%)",
+      fill  = "Cell Type"
+    ) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5, size = 13),
+      legend.text     = element_text(size = 8),
+      legend.key.size = unit(0.4, "cm"),
+      legend.title    = element_text(size = 9, face = "bold"),
+      axis.text       = element_text(size = 12),
+      axis.title      = element_text(size = 12)
+    ) +
+    guides(fill = guide_legend(ncol = 1))
+
+  ggsave(filename, p, width = width, height = height, dpi = 300)
+  cat("  Saved:", filename, "\n")
+  invisible(p)
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# 3.  PLOTS
+# ══════════════════════════════════════════════════════════════════════════
+cat("\n--- Pooled NSCLC composition ---\n")
+make_composition_plot(
+  merged_df = pooled_merged,
+  title     = "Immune Cell Composition — High vs Low Risk\nPooled NSCLC (LUAD + LUSC)",
+  filename  = "CIBERSORT_composition_Pooled_NSCLC.png"
+)
+
+cat("\n--- LUAD composition ---\n")
+make_composition_plot(
+  merged_df = luad_merged,
+  title     = "Immune Cell Composition — High vs Low Risk\nTCGA-LUAD",
+  filename  = "CIBERSORT_composition_LUAD.png"
+)
+
+cat("\n--- LUSC composition ---\n")
+make_composition_plot(
+  merged_df = lusc_merged,
+  title     = "Immune Cell Composition — High vs Low Risk\nTCGA-LUSC",
+  filename  = "CIBERSORT_composition_LUSC.png"
+)
+
+cat("\nAll composition plots done.\n")
+```
+
+
+
+
+
+
+

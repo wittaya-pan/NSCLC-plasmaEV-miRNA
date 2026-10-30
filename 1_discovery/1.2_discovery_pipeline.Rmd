@@ -1,0 +1,3580 @@
+---
+title: "New 34 patients"
+output: html_notebook
+---
+
+```{r}
+# ========================
+# LIBRARIES
+# ========================
+library(limma)
+library(sva)       # ComBat
+library(dplyr)
+library(tibble)
+library(ggplot2)
+
+# ========================
+# STEP 1: Load & align
+# ========================
+counts   <- read.csv("Count_Matrix_removed_unknown.csv", row.names = 1)
+metadata <- read.csv("Metadata_Limma_dead_time_all.csv", row.names = 1)
+
+# Transpose: rows = miRNAs, cols = samples
+counts <- t(counts)
+colnames(counts)  <- trimws(colnames(counts))
+rownames(metadata) <- trimws(rownames(metadata))
+
+common_samples <- intersect(colnames(counts), rownames(metadata))
+counts   <- counts[, common_samples, drop = FALSE]
+metadata <- metadata[common_samples, , drop = FALSE]
+
+# ========================
+# STEP 2: Log2 transform
+# NanoString outputs are already normalized counts (floats).
+# Do NOT use DGEList/TMM/voom — those require raw integer counts.
+# ========================
+log2_counts <- log2(counts + 1)   # miRNAs × samples matrix
+
+# ========================
+# STEP 3: Filter low-expression miRNAs
+# Keep miRNAs with median log2 expression > 1 in at least one group
+# This reduces the multiple testing burden (798 → ~500 miRNAs)
+# ========================
+dead_samps  <- rownames(metadata)[metadata$dead.status == 1]
+alive_samps <- rownames(metadata)[metadata$dead.status == 0]
+
+med_dead  <- apply(log2_counts[, dead_samps],  1, median)
+med_alive <- apply(log2_counts[, alive_samps], 1, median)
+keep      <- (med_dead > 1) | (med_alive > 1)
+
+log2_counts <- log2_counts[keep, ]
+cat("miRNAs after filtering:", sum(keep), "\n")
+
+# ========================
+# STEP 4: Factor variables
+# ========================
+metadata$dead.status <- factor(metadata$dead.status,
+                                levels = c(0, 1),
+                                labels = c("Alive", "Dead"))
+metadata$Batch <- factor(metadata$Batch)
+
+# ========================
+# STEP 5: ComBat batch correction
+# mod protects dead.status from being removed during correction — correct ✓
+# ComBat is applied to log2 data directly (not voom output)
+# ========================
+modcombat   <- model.matrix(~ dead.status, data = metadata)
+combat_expr <- ComBat(dat      = log2_counts,
+                      batch    = metadata$Batch,
+                      mod      = modcombat,
+                      par.prior = TRUE,
+                      prior.plots = FALSE)
+
+print(table(metadata$Batch, metadata$dead.status))
+# ========================
+# STEP 6: PCA after ComBat
+# ========================
+pca_combat <- prcomp(t(combat_expr), scale. = TRUE)
+
+pca_data <- data.frame(pca_combat$x,
+                        Status = metadata$dead.status,
+                        Batch  = metadata$Batch)
+
+ggplot(pca_data, aes(PC1, PC2, color = Status, shape = Batch)) +
+  geom_point(size = 3) +
+  ggtitle("PCA after ComBat") +
+  theme_bw()
+ggsave("PCA_ComBat.png")
+
+# ========================
+# STEP 7: Limma DE — Dead vs Alive
+# Design WITHOUT batch: batch variance was removed by ComBat.
+# Use lmFit directly on log2 matrix (no voom needed — data is not counts).
+# ========================
+Design  <- model.matrix(~ 0 + dead.status, data = metadata)
+colnames(Design) <- levels(metadata$dead.status)
+
+fit     <- lmFit(combat_expr, Design)          # no weights argument
+contrast <- makeContrasts(Dead - Alive, levels = Design)
+fit2    <- contrasts.fit(fit, contrast)
+fit2    <- eBayes(fit2, trend = TRUE, robust = TRUE)
+
+results <- topTable(fit2, adjust = "fdr", number = Inf) %>%
+  rownames_to_column(var = "miRNA")
+
+# ========================
+# STEP 8: Export
+# ========================
+write.csv(results, "DE_results_ComBat_dead.csv", row.names = FALSE)
+
+# Merge with expression table
+expression_table <- as.data.frame(combat_expr) %>%
+  rownames_to_column(var = "miRNA")
+
+results_with_expr <- merge(results, expression_table,
+                            by = "miRNA", all.x = TRUE)
+write.csv(results_with_expr,
+          "DE_results_ComBat_dead_with_expression.csv",
+          row.names = FALSE)
+
+# Transposed expression (samples × miRNAs) for downstream use
+expression_table_df <- as.data.frame(t(combat_expr)) %>%
+  rownames_to_column(var = "SampleID")
+write.csv(expression_table_df, "combat_counts.csv", row.names = FALSE)
+
+# Save PCA object
+saveRDS(pca_combat, file = "pca_combat.rds")
+
+head(results)
+```
+
+#Vocalno plot 
+```{r}
+library(ggplot2)
+library(ggrepel)
+
+# ── Load data ──────────────────────────────────────────────────────────────
+data <- read.csv("DE_results_ComBat_dead.csv")
+
+# ── Define thresholds ──────────────────────────────────────────────────────
+p_thresh  <- 0.05
+fc_thresh <- 0.5   # changed from 1 → 0.5
+
+# ── -log10 P and category ──────────────────────────────────────────────────
+data$neg_log_pvalue <- -log10(data$P.Value)
+
+data$category <- with(data,
+  ifelse(P.Value < p_thresh & logFC >  fc_thresh, "Up",
+  ifelse(P.Value < p_thresh & logFC < -fc_thresh, "Down", "Not Sig")))
+
+data$category <- factor(data$category, levels = c("Up", "Down", "Not Sig"))
+
+# ── Select labels: top 5 up + top 5 down by logFC ─────────────────────────
+top_up <- data[data$category == "Up", ]
+top_up <- top_up[order(-top_up$logFC), ]
+top_up <- head(top_up, 5)
+
+top_down <- data[data$category == "Down", ]
+top_down <- top_down[order(top_down$logFC), ]   # ascending = most negative first
+top_down <- head(top_down, 5)
+
+top_label <- rbind(top_up, top_down)
+
+# ── Count sig miRNAs for subtitle ─────────────────────────────────────────
+n_up   <- sum(data$category == "Up",   na.rm = TRUE)
+n_down <- sum(data$category == "Down", na.rm = TRUE)
+
+# ── Volcano plot ───────────────────────────────────────────────────────────
+volcano_plot <- ggplot(data, aes(x = logFC, y = neg_log_pvalue, color = category)) +
+  
+  # Points
+  geom_point(alpha = 0.45, size = 2.5) +
+  scale_color_manual(
+    values = c("Up" = "firebrick", "Down" = "deepskyblue3", "Not Sig" = "grey70"),
+    labels = c(
+      paste0("Up (n=", n_up, ")"),
+      paste0("Down (n=", n_down, ")"),
+      "Not significant"
+    )
+  ) +
+  
+  # Threshold lines  ── linewidth replaces deprecated size ──
+  geom_vline(xintercept = c(-fc_thresh, fc_thresh),
+             linetype = "dashed", color = "lightsalmon", linewidth = 0.7) +
+  geom_hline(yintercept = -log10(p_thresh),
+             linetype = "dashed", color = "lightsalmon", linewidth = 0.7) +
+  
+  # Labels for top hits  ── aes(label = miRNA) not aes(label = df$col) ──
+  geom_label_repel(
+    data        = top_label,
+    aes(label   = miRNA),          # fix: removed top_proteins_5$miRNA
+    color       = "black",
+    box.padding = 0.4,
+    point.padding = 0.3,
+    segment.color = "grey50",
+    segment.size  = 0.4,
+    size          = 3.2,
+    max.overlaps  = 20,
+    show.legend   = FALSE
+  ) +
+  
+  # Axes and labels
+  labs(
+    title    = "Volcano Plot — Dead vs Alive (miRNA)",
+    subtitle = paste0("Criteria: P < 0.05, |logFC| > 0.5"),
+    x        = "Log2 Fold Change (Dead / Alive)",
+    y        = "-Log10 P-Value",
+    color    = NULL
+  ) +
+  
+  # Theme
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position   = "bottom",
+    legend.text       = element_text(size = 10),
+    plot.title        = element_text(face = "bold", size = 13),
+    plot.subtitle     = element_text(size = 10, color = "grey40"),
+    panel.grid.minor  = element_blank()
+  ) +
+  guides(color = guide_legend(override.aes = list(alpha = 1, size = 3)))
+
+# ── Version with fixed x-axis ──────────────────────────────────────────────
+volcano_plot_clipped <- volcano_plot +
+  xlim(-2, 2)   # adjusted from ±2.5 to match new |logFC| > 0.5 scale
+
+# ── Print and save ─────────────────────────────────────────────────────────
+print(volcano_plot)
+print(volcano_plot_clipped)
+
+ggsave("volcano_plot_dead_P05_FC05.png",
+       plot   = volcano_plot,
+       width  = 6, height = 7, dpi = 300)
+
+ggsave("volcano_plot_dead_P05_FC05_clipped.png",
+       plot   = volcano_plot_clipped,
+       width  = 6, height = 7, dpi = 300)
+```
+
+#heatmap
+```{r}
+library(pheatmap)
+library(dplyr)
+
+# ── Load data ──────────────────────────────────────────────────────────────
+de      <- read.csv("DE_results_ComBat_dead.csv")
+combat  <- read.csv("combat_counts.csv", row.names = 1)   # samples × miRNAs
+metadata <- read.csv("Metadata_Limma_dead_time_all.csv", row.names = 1)
+
+# ── Select significant miRNAs (P < 0.05, |logFC| > 0.5) ──────────────────
+sig_mirna <- de %>%
+  filter(P.Value < 0.05, abs(logFC) > 0.5) %>%
+  arrange(P.Value) %>%
+  pull(miRNA)
+
+cat("Significant miRNAs:", length(sig_mirna), "\n")
+
+# ── Prepare expression matrix: miRNAs × samples ───────────────────────────
+# combat_counts.csv is samples × miRNAs → transpose
+expr_mat <- t(combat[, sig_mirna, drop = FALSE])   # miRNA × sample
+
+# Align metadata to sample order in expr_mat
+metadata <- metadata[colnames(expr_mat), , drop = FALSE]
+
+# ── Z-score per row (per miRNA) ───────────────────────────────────────────
+zscore_mat <- t(scale(t(expr_mat)))   # scale() works on columns → double-transpose
+
+# ── Annotation columns (sample metadata) ─────────────────────────────────
+anno_col <- data.frame(
+  Status   = ifelse(metadata$dead.status == 1, "Dead", "Alive"),
+  Batch    = paste0("Batch ", metadata$Batch),
+  row.names = rownames(metadata)
+)
+
+# Order samples: Alive first, then Dead (cleaner visual grouping)
+sample_order <- c(
+  rownames(anno_col)[anno_col$Status == "Alive"],
+  rownames(anno_col)[anno_col$Status == "Dead"]
+)
+zscore_mat <- zscore_mat[, sample_order]
+anno_col   <- anno_col[sample_order, , drop = FALSE]
+
+# ── Annotation colors ─────────────────────────────────────────────────────
+anno_colors <- list(
+  Status = c("Alive" = "deepskyblue3", "Dead" = "firebrick"),
+  Batch  = c("Batch 1" = "#F0A500", "Batch 2" = "#7B5EA7", "Batch 3" = "#3A9E6F")
+)
+
+# ── Clean miRNA row labels ─────────────────────────────────────────────────
+# Show labels only if <= 30 miRNAs, otherwise hide to avoid crowding
+show_rownames <- length(sig_mirna) <= 30
+
+# ── Draw heatmap ───────────────────────────────────────────────────────────
+p <- pheatmap(
+  mat              = zscore_mat,
+  color            = colorRampPalette(c("deepskyblue3", "white", "firebrick"))(100),
+  breaks           = seq(-2, 2, length.out = 101),  # cap z-score range at ±2
+  
+  # Clustering
+  cluster_rows     = TRUE,
+  cluster_cols     = FALSE,   # FALSE: keep Alive/Dead groups together
+  clustering_method = "ward.D2",
+  
+  # Annotations
+  annotation_col   = anno_col,
+  annotation_colors = anno_colors,
+  
+  # Labels
+  show_rownames    = show_rownames,
+  show_colnames    = TRUE,
+  fontsize_row     = 8,
+  fontsize_col     = 7,
+  
+  # Appearance
+  border_color     = NA,
+  cellwidth        = 14,
+  cellheight       = ifelse(show_rownames, 14, 8),
+  
+  # Title
+  main             = "Differentially expressed miRNA — Dead vs Alive\n(P < 0.05, |logFC| > 0.5, z-score)"
+)
+
+# ── Save ───────────────────────────────────────────────────────────────────
+# Auto-size height based on number of miRNAs
+plot_height <- max(5, 2 + length(sig_mirna) * 0.25)
+
+ggsave("heatmap_dead_zscore.png",
+       plot   = p,
+       width  = 10,
+       height = plot_height,
+       dpi    = 300)
+
+# Also save as PDF for publication
+pdf("heatmap_dead_zscore.pdf", width = 10, height = plot_height)
+print(p)
+dev.off()
+```
+
+#uni cox
+```{r}
+library(tibble)
+library(dplyr)
+library(survival)
+library(ggplot2)
+library(scales)
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 1: Load data
+# combat_counts.csv: samples × miRNAs, log2 ComBat-corrected.
+# Z-scoring is applied BELOW before Cox fitting.
+# ═══════════════════════════════════════════════════════════════════
+expr_raw <- read.csv("combat_counts.csv")          # SampleID + miRNA columns
+metadata  <- read.csv("Metadata_Limma_dead_time_all.csv", row.names = 1)
+de        <- read.csv("DE_results_ComBat_dead.csv")
+
+cat("Samples:", nrow(expr_raw), "\n")
+cat("miRNAs: ", ncol(expr_raw) - 1, "\n")
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 1.5: Z-score each miRNA across samples
+# Applied AFTER log2 ComBat, BEFORE Cox
+# scale() works on columns → transpose twice to z-score per miRNA
+# ═══════════════════════════════════════════════════════════════════
+mirna_cols <- setdiff(colnames(expr_raw), "SampleID")
+expr_raw[, mirna_cols] <- scale(expr_raw[, mirna_cols])
+
+cat("Z-scoring applied to", length(mirna_cols), "miRNAs\n")
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 2: Build survival + expression dataset
+# ═══════════════════════════════════════════════════════════════════
+surv_meta <- metadata %>%
+  rownames_to_column("SampleID") %>%
+  transmute(
+    SampleID = SampleID,
+    time     = as.numeric(Time.Dead),
+    status   = as.integer(dead.status)   # 1 = dead, 0 = alive
+  )
+
+cox_data <- merge(surv_meta, expr_raw, by = "SampleID")
+
+cat("Events:", sum(cox_data$status), "/", nrow(cox_data),
+    " (", round(mean(cox_data$status)*100, 1), "%)\n")
+cat("Follow-up:", min(cox_data$time), "–", max(cox_data$time), "months\n")
+
+write.csv(cox_data, "zscore_combat_data_for_Cox.csv", row.names = FALSE)
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 3: Select candidate miRNAs
+# Criteria: P < 0.05 AND |logFC| > 0.5 from DE analysis
+# ═══════════════════════════════════════════════════════════════════
+candidates <- de %>%
+  filter(P.Value < 0.05, abs(logFC) > 0.5) %>%   # FIXED: was 0.054
+  arrange(P.Value) %>%
+  pull(miRNA)
+
+candidates <- candidates[candidates %in% colnames(cox_data)]
+cat("Candidate miRNAs for univariate Cox:", length(candidates), "\n")
+
+if (length(candidates) == 0) {
+  stop("No candidate miRNAs found — check dot vs dash notation in column names.")
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 4: Univariate Cox regression
+# β is now in SD units (z-scored) — portable to TCGA
+# ═══════════════════════════════════════════════════════════════════
+surv_obj <- Surv(time = cox_data$time, event = cox_data$status)
+
+results_list <- vector("list", length(candidates))
+
+for (i in seq_along(candidates)) {
+  mirna <- candidates[i]
+
+  results_list[[i]] <- tryCatch({
+    fit <- coxph(
+      as.formula(paste0("surv_obj ~ `", mirna, "`")),
+      data = cox_data,
+      ties = "efron"
+    )
+    s <- summary(fit)
+
+    data.frame(
+      miRNA        = mirna,
+      coef         = s$coefficients[1, "coef"],
+      HR           = s$conf.int[1, "exp(coef)"],
+      HR_lower95   = s$conf.int[1, "lower .95"],
+      HR_upper95   = s$conf.int[1, "upper .95"],
+      SE           = s$coefficients[1, "se(coef)"],
+      z            = s$coefficients[1, "z"],
+      p_value      = s$coefficients[1, "Pr(>|z|)"],
+      concordance  = as.numeric(s$concordance["C"]),
+      stringsAsFactors = FALSE
+    )
+  }, error = function(e) {
+    message("  Skipped ", mirna, ": ", e$message)
+    NULL
+  })
+}
+
+uni_cox <- bind_rows(results_list) %>%
+  mutate(
+    FDR       = p.adjust(p_value, method = "BH"),
+    Direction = ifelse(HR > 1, "Risk", "Protective")
+  ) %>%
+  arrange(p_value)
+
+write.csv(uni_cox, "Univariate_Cox_zscore_all.csv", row.names = FALSE)
+
+sig_uni <- uni_cox %>% filter(p_value < 0.05)
+write.csv(sig_uni, "Univariate_Cox_zscore_significant.csv", row.names = FALSE)
+
+cat("\n─── Univariate Cox results (z-scored ComBat values) ───\n")
+cat("Tested:     ", nrow(uni_cox), "\n")
+cat("p < 0.05:   ", nrow(sig_uni), "\n")
+cat("FDR < 0.05: ", sum(uni_cox$FDR < 0.05, na.rm = TRUE),
+    " (note: underpowered with n=34)\n\n")
+
+print(uni_cox %>%
+  dplyr::select(miRNA, coef, HR, HR_lower95, HR_upper95, p_value, FDR, concordance) %>%
+  mutate(across(where(is.numeric), ~round(., 4))))
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 5: Forest plot — FIXED: sig_cox → sig_uni, factor levels fixed
+# ═══════════════════════════════════════════════════════════════════
+plot_data <- sig_uni %>%                           # FIXED: was sig_cox
+  mutate(
+    label      = gsub("\\.", "-", miRNA),
+    label      = factor(label,
+                   levels = rev(gsub("\\.", "-", sig_uni$miRNA))),  # FIXED: was uni_cox
+    Significant = ifelse(p_value < 0.05, Direction, "Not significant"),
+    Significant = factor(Significant,
+                   levels = c("Risk", "Protective", "Not significant")),
+    annot = paste0("HR=", round(HR, 2),
+                   " (", round(HR_lower95, 2), "–", round(HR_upper95, 2), ")",
+                   "  p=", formatC(p_value, digits = 1, format = "g"))
+  )
+
+ci_cap <- quantile(c(plot_data$HR_lower95, plot_data$HR_upper95), 0.97, na.rm = TRUE)
+
+forest <- ggplot(plot_data, aes(x = HR, y = label, color = Significant)) +
+
+  geom_vline(xintercept = 1, linetype = "dashed",
+             color = "grey50", linewidth = 0.6) +
+
+  geom_errorbarh(
+    aes(xmin = pmax(HR_lower95, 0.01),
+        xmax = pmin(HR_upper95, ci_cap)),
+    height = 0.3, linewidth = 0.65
+  ) +
+
+  geom_point(size = 3.2, shape = 18) +
+
+  geom_text(
+    data = plot_data,
+    aes(x     = pmin(HR_upper95, ci_cap) + 0.05,
+        y     = label,
+        label = annot),
+    hjust = 0, size = 2.8, color = "grey20", inherit.aes = FALSE
+  ) +
+
+  scale_color_manual(
+    values = c("Risk"            = "#B22222",
+               "Protective"      = "#1874CD",
+               "Not significant" = "grey65"),
+    drop = FALSE
+  ) +
+
+  scale_x_continuous(
+    name   = "Hazard Ratio (95% CI)  —  z-scored ComBat-corrected expression",
+    limits = c(0.25, 6.5),
+    trans  = "log10",
+    labels = number_format(accuracy = 0.01),
+    expand = c(0, 0)
+  ) +
+
+  labs(
+    title    = "Univariate Cox regression — Overall survival (Dead vs Alive)",
+    subtitle = paste0(
+      "n = ", nrow(cox_data), " patients  |  ",
+      sum(cox_data$status), " events  |  ",
+      nrow(sig_uni), " miRNAs p < 0.05",
+      "  |  z-scored ComBat-corrected expression"
+    ),
+    y = NULL, color = NULL
+  ) +
+
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position    = "bottom",
+    legend.text        = element_text(size = 10),
+    panel.grid.major.y = element_line(color = "grey93", linewidth = 0.4),
+    panel.grid.minor   = element_blank(),
+    plot.title         = element_text(face = "bold", size = 12),
+    plot.subtitle      = element_text(color = "grey40", size = 9),
+    axis.text.y        = element_text(size = 9),
+    axis.text.x        = element_text(size = 9)
+  )
+
+plot_h <- max(5, 1.8 + nrow(plot_data) * 0.30)
+ggsave("forestplot_univariate_cox_zscore.png",
+       plot = forest, width = 11, height = plot_h, dpi = 300)
+
+print(forest)
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 6: Save coefficients for TCGA validation
+# β is in SD units — apply to z-scored TCGA log2 expression
+# ═══════════════════════════════════════════════════════════════════
+coef_table <- sig_uni %>%
+  dplyr::select(miRNA, coef, HR, HR_lower95, HR_upper95, p_value, concordance) %>%
+  mutate(
+    miRNA_dash = gsub("\\.", "-", miRNA),
+    note = "β from z-scored log2 ComBat Cox; apply to z-scored log2(x+1) TCGA expression"
+  )
+
+write.csv(coef_table, "Cox_coefficients_for_validation.csv", row.names = FALSE)
+cat("\nCoefficient table saved → apply β to z-scored TCGA log2 expression.\n")
+
+ggsave("forestplot_univariate_cox_zscore.pdf", 
+       plot = forest, 
+       width = 12.5, 
+       height = plot_h,
+       device = cairo_pdf) # cairo_pdf handles special characters better
+```
+
+#forest plot
+```{r}
+library(dplyr)
+library(forestplot)
+library(grid)
+
+# ── Load & sort ───────────────────────────────────────────────────
+# UPDATED: load z-scored results
+sig_uni <- read.csv("Univariate_Cox_zscore_significant.csv") %>%
+  arrange(p_value)
+
+sig_uni$miRNA_display <- gsub("\\.", "-", sig_uni$miRNA)
+
+# ── Clip range ────────────────────────────────────────────────────
+clip_lo <- max(0.01, floor(min(sig_uni$HR_lower95, na.rm = TRUE) * 0.8 * 10) / 10)
+clip_hi <- min(100,  ceiling(max(sig_uni$HR_upper95, na.rm = TRUE) * 1.2 * 10) / 10)
+
+# ── Label matrix ──────────────────────────────────────────────────
+label_text <- rbind(
+  c("miRNA", "HR (95% CI)", "P-value"),
+  cbind(
+    sig_uni$miRNA_display,
+    sprintf("%.2f (%.2f–%.2f)", sig_uni$HR, sig_uni$HR_lower95, sig_uni$HR_upper95),
+    formatC(sig_uni$p_value, digits = 3, format = "g")
+  )
+)
+
+# ── Data Vectors ──────────────────────────────────────────────────
+hr_vec   <- c(NA, sig_uni$HR)
+ci_lower <- c(NA, sig_uni$HR_lower95)
+ci_upper <- c(NA, sig_uni$HR_upper95)
+
+# ── Per-row box colors ────────────────────────────────────────────
+box_colors <- c(
+  "black",
+  ifelse(sig_uni$HR > 1, "#B22222", "#1874CD")
+)
+
+# ── Shared forestplot arguments ───────────────────────────────────
+fp_args <- list(
+  labeltext   = label_text,
+  mean        = hr_vec,
+  lower       = ci_lower,
+  upper       = ci_upper,
+  is.summary  = c(TRUE, rep(FALSE, nrow(sig_uni))),
+  zero        = 1,
+  xlog        = TRUE,
+  clip        = c(clip_lo, clip_hi),
+  # UPDATED: axis label reflects z-scored expression
+  xlab        = "Hazard Ratio (log scale) — z-scored log2 ComBat expression",
+  boxsize     = 0.25,
+  lineheight  = unit(8, "mm"),
+  ci.vertices = TRUE,
+  ci.vertices.height = 0.15,
+  grid        = TRUE,
+  col = fpColors(
+    box     = box_colors,
+    line    = "grey30",
+    zero    = "black",
+    summary = "black"
+  ),
+  txt_gp = fpTxtGp(
+    label   = gpar(fontsize = 10),
+    ticks   = gpar(fontsize = 9),
+    xlab    = gpar(fontsize = 10),
+    title   = gpar(fontsize = 11, fontface = "bold")
+  ),
+  title       = paste0(
+    "Univariate Cox — Overall Survival\n",
+    "n = events / total  |  z-scored ComBat-corrected expression"
+  ),
+  colgap      = unit(3, "mm"),
+  graphwidth  = unit(60, "mm"),
+  align       = c("l", "c", "c")
+)
+
+# ── Save PDF ──────────────────────────────────────────────────────
+pdf_h <- max(4, 1.5 + nrow(sig_uni) * 0.4)
+pdf("forestplot_univariate_cox_zscore.pdf", width = 10, height = pdf_h)
+do.call(forestplot, fp_args)
+dev.off()
+
+# ── Save PNG ──────────────────────────────────────────────────────
+png_h <- max(400, 150 + nrow(sig_uni) * 40)
+png("forestplot_univariate_cox_zscore.png", width = 1200, height = png_h, res = 130)
+do.call(forestplot, fp_args)
+dev.off()
+
+cat("Forest plots saved:\n")
+cat("  forestplot_univariate_cox_zscore.pdf\n")
+cat("  forestplot_univariate_cox_zscore.png\n")
+```
+
+#merge data cox miRNA with metadata
+```{r}
+library(dplyr)
+library(tibble)
+
+# ── STEP 1: Load significant Cox results ─────────────────────────────────────
+# UPDATED: load z-scored results
+cox_sig <- read.csv("Univariate_Cox_zscore_significant.csv") %>%
+  arrange(p_value)
+
+sig_mirna_names <- cox_sig$miRNA   # dot-notation, matches expression column names
+
+cat("Significant miRNAs (p < 0.05):", length(sig_mirna_names), "\n")
+print(sig_mirna_names)
+
+if (length(sig_mirna_names) == 0) {
+  stop("No significant miRNAs found. Check Univariate_Cox_zscore_significant.csv")
+}
+
+# ── STEP 2: Load z-scored ComBat-corrected expression ────────────────────────
+# UPDATED: use z-scored data — model was built on z-scored values
+# File: "zscore_combat_data_for_Cox.csv" (samples × miRNAs, has time + status)
+combat_expr <- read.csv("zscore_combat_data_for_Cox.csv")
+
+# Keep SampleID + significant miRNAs only
+expr_selected <- combat_expr %>%
+  select(all_of(c("SampleID", sig_mirna_names)))
+
+cat("Expression matrix after selection:", nrow(expr_selected), "samples ×",
+    ncol(expr_selected) - 1, "miRNAs\n")
+
+# ── STEP 3: Load full clinical metadata ──────────────────────────────────────
+metadata <- read.csv("Metadata_Limma_dead_time_all.csv")
+
+cat("Metadata columns:", paste(colnames(metadata), collapse = ", "), "\n")
+
+# ── STEP 4: Merge metadata + selected expression ─────────────────────────────
+final_data <- merge(metadata, expr_selected, by = "SampleID") %>%
+  arrange(dead.status, Time.Dead)
+
+cat("\nFinal merged dataset:", nrow(final_data), "rows ×",
+    ncol(final_data), "columns\n")
+cat("Columns:", paste(colnames(final_data), collapse = ", "), "\n")
+
+# ── STEP 5: Rename miRNA columns dot → dash for display ──────────────────────
+rename_map <- setNames(sig_mirna_names, gsub("\\.", "-", sig_mirna_names))
+
+final_data_display <- final_data %>%
+  rename(all_of(rename_map))
+
+# ── STEP 6: Save ─────────────────────────────────────────────────────────────
+write.csv(final_data,
+          "Merged_sigCox_zscore_with_metadata.csv",
+          row.names = FALSE)
+
+write.csv(final_data_display,
+          "Merged_sigCox_zscore_with_metadata_dashlabels.csv",
+          row.names = FALSE)
+
+cat("\n--- Saved ---\n")
+cat("Merged_sigCox_zscore_with_metadata.csv            (dot-notation — for R modeling)\n")
+cat("Merged_sigCox_zscore_with_metadata_dashlabels.csv (dash-notation — for tables/figures)\n")
+
+# ── Preview ───────────────────────────────────────────────────────────────────
+cat("\nPreview (metadata + first 3 miRNAs):\n")
+print(final_data[, c("SampleID", "dead.status", "Time.Dead",
+                      sig_mirna_names[1:min(3, length(sig_mirna_names))])])
+```
+
+
+#ROC
+```{r}
+library(survival)
+library(pROC)
+library(ggplot2)
+library(plotROC)
+library(dplyr)
+
+# ── Load data ─────────────────────────────────────────────────────────────────
+# UPDATED: load z-scored merged data
+data_wide <- read.csv("Merged_sigCox_zscore_with_metadata.csv")
+cox_sig   <- read.csv("Univariate_Cox_zscore_significant.csv") %>%
+  arrange(p_value)
+
+sig_mirnas <- cox_sig$miRNA
+
+cat("Samples:", nrow(data_wide), "\n")
+cat("miRNAs to plot:", length(sig_mirnas), "\n")
+
+# ── Output folder ─────────────────────────────────────────────────────────────
+dir.create("ROC_plots", showWarnings = FALSE)
+
+# ── Initialise summary table ──────────────────────────────────────────────────
+roc_summary <- data.frame(
+  miRNA       = character(),
+  AUC         = numeric(),
+  AUC_lower95 = numeric(),
+  AUC_upper95 = numeric(),
+  sensitivity = numeric(),
+  specificity = numeric(),
+  cutoff      = numeric(),
+  direction   = character(),
+  stringsAsFactors = FALSE
+)
+
+# ── ROC loop ──────────────────────────────────────────────────────────────────
+for (mirna in sig_mirnas) {
+
+  if (!mirna %in% colnames(data_wide)) {
+    message("Skipping — column not found: ", mirna)
+    next
+  }
+
+  mirna_label <- gsub("\\.", "-", mirna)
+
+  hr_val    <- cox_sig$HR[cox_sig$miRNA == mirna][1]
+  direction <- as.character(ifelse(hr_val > 1, "<", ">"))
+
+  if (is.na(direction) || length(direction) != 1) {
+    message("Skipping — could not determine direction for: ", mirna)
+    next
+  }
+
+  # ── Compute ROC ────────────────────────────────────────────────────────────
+  roc_obj <- roc(
+    response  = data_wide$dead.status,
+    predictor = data_wide[[mirna]],
+    direction = direction,
+    quiet     = TRUE
+  )
+
+  auc_val <- as.numeric(auc(roc_obj))
+  auc_ci  <- ci.auc(roc_obj, conf.level = 0.95)
+
+  best <- coords(roc_obj, "best",
+                 ret         = c("threshold", "sensitivity", "specificity"),
+                 best.method = "youden",
+                 transpose   = FALSE)
+
+  ann_text <- sprintf(
+    "AUC = %.3f (%.3f\u2013%.3f)\nSensitivity = %.3f\nSpecificity = %.3f\nCut-off = %.3f",
+    auc_val, auc_ci[1], auc_ci[3],
+    best$sensitivity[1],
+    best$specificity[1],
+    best$threshold[1]
+  )
+
+  # Flip predictor sign for protective miRNAs so curve goes above diagonal
+  expr_for_plot <- if (direction == "<") {
+    data_wide[[mirna]]
+  } else {
+    -data_wide[[mirna]]
+  }
+
+  roc_df <- data.frame(D = data_wide$dead.status, M = expr_for_plot)
+
+  p <- ggplot(roc_df, aes(m = M, d = D)) +
+    geom_roc(n.cuts = 0, labels = FALSE,
+             color = "#4A249D", linewidth = 1) +
+    style_roc() +
+    geom_abline(linetype = "dashed", color = "grey60", linewidth = 0.5) +
+    annotate("text", x = 0.55, y = 0.25, label = ann_text,
+             hjust = 0, vjust = 0, size = 3.5, color = "black") +
+    labs(
+      title    = mirna_label,
+      subtitle = "z-scored log2 ComBat-corrected expression",   # ADDED
+      x        = "1 - Specificity (FPR)",
+      y        = "Sensitivity (TPR)"
+    ) +
+    coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+    theme_bw(base_size = 11) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(color = "grey40", size = 9),  # ADDED
+      panel.grid.minor = element_blank()
+    )
+
+  outfile <- file.path("ROC_plots",
+                       paste0("ROC_zscore_", gsub("\\.", "_", mirna), ".png"))  # UPDATED prefix
+  ggsave(outfile, plot = p, width = 5, height = 4.5, dpi = 300)
+
+  roc_summary <- rbind(roc_summary, data.frame(
+    miRNA       = mirna_label,
+    AUC         = round(auc_val, 4),
+    AUC_lower95 = round(auc_ci[1], 4),
+    AUC_upper95 = round(auc_ci[3], 4),
+    sensitivity = round(best$sensitivity[1], 4),
+    specificity = round(best$specificity[1], 4),
+    cutoff      = round(best$threshold[1], 4),
+    direction   = direction,
+    stringsAsFactors = FALSE
+  ))
+
+  cat(sprintf("  %s  AUC=%.3f  dir=%s\n", mirna_label, auc_val, direction))
+}
+
+# ── Save summary table ────────────────────────────────────────────────────────
+roc_summary <- roc_summary %>% arrange(desc(AUC))
+
+write.csv(roc_summary,
+          "ROC_summary_zscore_sigCox_miRNAs.csv",   # UPDATED filename
+          row.names = FALSE)
+
+cat("\n─── ROC Summary ───\n")
+print(roc_summary)
+cat("\nAll plots saved to: ROC_plots/\n")
+cat("Summary table: ROC_summary_zscore_sigCox_miRNAs.csv\n")
+```
+
+#RSF
+```{r}
+library(randomForestSRC)
+options(rf.cores = 1, mc.cores = 1)  # single core: makes VIMP reproducible (matches Table S3)
+library(survival)
+library(dplyr)
+library(ggplot2)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 1: Load and prepare data
+# UPDATED: z-scored ComBat-corrected expression
+# ═══════════════════════════════════════════════════════════════════
+raw <- read.csv("Merged_sigCox_zscore_with_metadata.csv",   # UPDATED
+                stringsAsFactors = FALSE)
+
+# Option B — Exclude Age (miRNA-only model)
+clinical_cols <- c("SampleID", "sex", "smoking", "histo_detail",
+                   "stage", "ajcc8_stage", "T", "N", "M",
+                   "firstline_detail", "firstline_category", "Batch",
+                   "Age")
+
+df <- raw %>%
+  select(-any_of(clinical_cols)) %>%
+  mutate(
+    dead.status = as.numeric(dead.status),
+    Time.Dead   = as.numeric(Time.Dead)
+  )
+
+mirna_cols <- setdiff(colnames(df), c("Time.Dead", "dead.status"))
+cat("Samples:         ", nrow(df), "\n")
+cat("Events:          ", sum(df$dead.status), "\n")
+cat("miRNA predictors:", length(mirna_cols), "\n")
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 2: RSF
+# ═══════════════════════════════════════════════════════════════════
+set.seed(42)
+rsf_model <- rfsrc(
+  Surv(Time.Dead, dead.status) ~ .,
+  data       = df,
+  ntree      = 1000,
+  nodesize   = 10,
+  mtry       = ceiling(sqrt(length(mirna_cols))),
+  importance = TRUE,
+  na.action  = "na.impute"
+)
+
+saveRDS(rsf_model, "rsf_model_zscore.rds")              # UPDATED filename
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 3: OOB performance
+# ═══════════════════════════════════════════════════════════════════
+oob_error  <- rsf_model$err.rate[rsf_model$ntree]
+oob_cindex <- 1 - oob_error
+
+cat("\n─── RSF Performance (OOB) ───\n")
+cat("OOB error rate:", round(oob_error,  4), "\n")
+cat("OOB C-index:   ", round(oob_cindex, 4), "\n")
+cat("(C-index > 0.7 = acceptable; > 0.8 = good)\n")
+
+sink("rsf_model_summary_zscore.txt")                    # UPDATED filename
+print(rsf_model)
+sink()
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 4: VIMP
+# ═══════════════════════════════════════════════════════════════════
+vimp_df <- data.frame(
+  miRNA      = names(rsf_model$importance),
+  VIMP       = as.numeric(rsf_model$importance),
+  miRNA_dash = gsub("\\.", "-", names(rsf_model$importance))
+) %>%
+  arrange(desc(VIMP))
+
+write.csv(vimp_df, "rsf_vimp_zscore.csv", row.names = FALSE)   # UPDATED
+
+cat("\n─── Top 10 by VIMP ───\n")
+print(head(vimp_df[, c("miRNA_dash", "VIMP")], 10))
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 5: Minimal depth
+# ═══════════════════════════════════════════════════════════════════
+set.seed(42)
+min_depth <- max.subtree(rsf_model, conservative = FALSE)
+
+depth_df <- data.frame(
+  miRNA           = rownames(min_depth$order),
+  Minimal_Depth   = min_depth$order[, 1],
+  Threshold_Depth = min_depth$order[, 2],
+  miRNA_dash      = gsub("\\.", "-", rownames(min_depth$order))
+) %>%
+  arrange(Minimal_Depth)
+
+threshold_val <- depth_df$Threshold_Depth[1]
+cat("\nMinimal depth threshold:", round(threshold_val, 4), "\n")
+
+write.csv(depth_df, "rsf_minimal_depth_zscore.csv", row.names = FALSE)  # UPDATED
+
+cat("\n─── Top 10 by Minimal Depth ───\n")
+print(head(depth_df[, c("miRNA_dash", "Minimal_Depth", "Threshold_Depth")], 10))
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 6: var.select
+# ═══════════════════════════════════════════════════════════════════
+set.seed(42)
+var_sel <- tryCatch(
+  randomForestSRC::var.select(object = rsf_model, conservative = "medium"),
+  error = function(e) NULL
+)
+
+if (is.null(var_sel)) {
+  set.seed(42)
+  var_sel <- tryCatch(
+    randomForestSRC::var.select.rfsrc(rsf_model, conservative = "medium"),
+    error = function(e) NULL
+  )
+}
+
+if (is.null(var_sel)) {
+  message("var.select unavailable — using manual minimal depth threshold")
+  selected_mirnas <- depth_df$miRNA[depth_df$Minimal_Depth <= threshold_val]
+} else {
+  selected_mirnas <- var_sel$topvars
+}
+
+selected_mirnas_dash <- gsub("\\.", "-", selected_mirnas)
+
+cat("\n─── Selected miRNAs ───\n")
+cat("n selected:", length(selected_mirnas), "\n")
+cat(paste(selected_mirnas_dash, collapse = "\n"), "\n")
+
+write.csv(
+  data.frame(miRNA = selected_mirnas, miRNA_dash = selected_mirnas_dash),
+  "rsf_selected_mirnas_zscore.csv", row.names = FALSE          # UPDATED
+)
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 7: Merge VIMP + minimal depth summary
+# ═══════════════════════════════════════════════════════════════════
+summary_df <- merge(
+  vimp_df  %>% select(miRNA, miRNA_dash, VIMP),
+  depth_df %>% select(miRNA, Minimal_Depth, Threshold_Depth),
+  by = "miRNA", all = TRUE
+) %>%
+  mutate(Selected_by_varSelect = miRNA %in% selected_mirnas) %>%
+  arrange(Minimal_Depth)
+
+write.csv(summary_df,
+          "rsf_summary_vimp_mindepth_zscore.csv",              # UPDATED
+          row.names = FALSE)
+
+cat("\n─── Combined summary (top 15) ───\n")
+print(head(summary_df[,
+  c("miRNA_dash", "VIMP", "Minimal_Depth", "Selected_by_varSelect")], 15))
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 8: Plots
+# ═══════════════════════════════════════════════════════════════════
+
+# ── Plot A: VIMP ──────────────────────────────────────────────────
+p_vimp <- vimp_df %>%
+  mutate(
+    miRNA_dash = factor(miRNA_dash, levels = rev(miRNA_dash)),
+    positive   = VIMP >= 0
+  ) %>%
+  ggplot(aes(x = VIMP, y = miRNA_dash, fill = positive)) +
+  geom_col(width = 0.7) +
+  geom_vline(xintercept = 0, color = "black", linewidth = 0.5) +
+  scale_fill_manual(values = c("TRUE" = "#B22222", "FALSE" = "#94a3b8"),
+                    guide = "none") +
+  labs(
+    title    = "RSF Variable Importance (VIMP)",
+    subtitle = paste0("n=", nrow(df), "  |  OOB C-index = ",
+                      round(oob_cindex, 3),
+                      "  |  z-scored ComBat expression"),   # UPDATED
+    x        = "VIMP (positive = important)",
+    y        = NULL
+  ) +
+  theme_bw(base_size = 11) +
+  theme(plot.title       = element_text(face = "bold"),
+        plot.subtitle    = element_text(color = "grey40", size = 9),
+        panel.grid.minor = element_blank(),
+        axis.text.y      = element_text(size = 9))
+
+ggsave("rsf_vimp_plot_zscore.png", p_vimp,                    # UPDATED
+       width = 7, height = max(4, 1.2 + nrow(vimp_df) * 0.28), dpi = 300)
+
+# ── Plot B: Minimal depth ─────────────────────────────────────────
+p_depth <- depth_df %>%
+  mutate(
+    miRNA_dash = factor(miRNA_dash, levels = rev(miRNA_dash)),
+    selected   = miRNA %in% selected_mirnas
+  ) %>%
+  ggplot(aes(x = Minimal_Depth, y = miRNA_dash, color = selected)) +
+
+  geom_segment(aes(x    = min(depth_df$Minimal_Depth) * 0.95,
+                   xend = Minimal_Depth,
+                   yend = miRNA_dash),
+               linewidth = 0.7) +
+
+  geom_point(size = 3) +
+
+  geom_vline(xintercept = threshold_val,
+             linetype = "dashed", color = "firebrick", linewidth = 0.6) +
+
+  annotate("text", x = threshold_val, y = Inf,
+           label = paste0("threshold = ", round(threshold_val, 3)),
+           hjust = -0.05, vjust = 1.5, size = 3, color = "firebrick") +
+
+  scale_color_manual(values = c("TRUE"  = "#B22222",
+                                 "FALSE" = "#94a3b8"),
+                     labels = c("Not selected",
+                                 "Selected by var.select"),
+                     name   = NULL) +
+
+  labs(
+    title    = "RSF Minimal Depth",
+    subtitle = paste0("z-scored ComBat expression  |  ",   # UPDATED
+                      "Red dashed = selection threshold"),
+    x        = "Minimal depth (smaller = more important)",
+    y        = NULL
+  ) +
+
+  theme_bw(base_size = 11) +
+  theme(plot.title       = element_text(face = "bold"),
+        plot.subtitle    = element_text(color = "grey40", size = 9),
+        legend.position  = "bottom",
+        panel.grid.minor = element_blank(),
+        axis.text.y      = element_text(size = 9))
+
+ggsave("rsf_minimal_depth_plot_zscore.png", p_depth,           # UPDATED
+       width = 7, height = max(4, 1.2 + nrow(depth_df) * 0.28), dpi = 300)
+
+cat("\n═══ RSF complete ═══\n")
+cat("  rsf_model_zscore.rds                  ← reload with readRDS()\n")
+cat("  rsf_selected_mirnas_zscore.csv        → input for LASSO Cox\n")
+cat("  rsf_summary_vimp_mindepth_zscore.csv\n")
+cat("  rsf_vimp_plot_zscore.png\n")
+cat("  rsf_minimal_depth_plot_zscore.png\n")
+cat("  OOB C-index:", round(oob_cindex, 3), "\n")
+```
+
+
+#top borda score selected
+```{r}
+library(randomForestSRC)
+library(survival)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+# ── Load RSF results ───────────────────────────────────────────────
+summary_df <- read.csv("rsf_summary_vimp_mindepth_zscore.csv")
+
+# ═══════════════════════════════════════════════════════════════════
+# RANK EACH METRIC + BORDA SCORE
+# ═══════════════════════════════════════════════════════════════════
+ranked <- summary_df %>%
+  mutate(
+    Rank_VIMP     = rank(-VIMP, ties.method = "min"),
+    Rank_MD       = rank(Minimal_Depth, ties.method = "min"),
+    VIMP_positive = VIMP > 0,
+    Borda_Score   = (Rank_VIMP + Rank_MD) / 2,
+    Borda_Rank    = rank(Borda_Score, ties.method = "min")
+  ) %>%
+  arrange(Borda_Score)
+
+# ═══════════════════════════════════════════════════════════════════
+# SELECT miRNAs WITH BORDA SCORE < 6
+# Excludes the tied pair (miR-30b-5p and miR-1268b, both Borda = 6)
+# Gives 4 unambiguous candidates
+# ═══════════════════════════════════════════════════════════════════
+selected <- ranked %>%
+  filter(
+    VIMP_positive == TRUE,
+    Borda_Score   <  6        # strict cutoff — excludes Borda = 6 tie
+  ) %>%
+  arrange(Borda_Score)
+
+cat("=== SELECTED miRNAs (Borda < 6) ===\n")
+cat("n selected:", nrow(selected), "\n\n")
+
+print(selected %>%
+  select(miRNA_dash, VIMP, Rank_VIMP,
+         Minimal_Depth, Rank_MD, Borda_Score))
+
+# ── Save ──────────────────────────────────────────────────────────
+ranked %>%
+  select(miRNA_dash, VIMP, Rank_VIMP,
+         Minimal_Depth, Rank_MD,
+         Borda_Score, Borda_Rank, VIMP_positive) %>%
+  write.csv("rsf_full_ranking_borda_zscore.csv", row.names = FALSE)
+
+write.csv(
+  selected %>%
+    select(miRNA = miRNA_dash, VIMP, Rank_VIMP,
+           Minimal_Depth, Rank_MD, Borda_Score),
+  "rsf_top4_borda_zscore.csv",                    # reflects 4 miRNAs
+  row.names = FALSE
+)
+
+# ═══════════════════════════════════════════════════════════════════
+# PLOT
+# ═══════════════════════════════════════════════════════════════════
+plot_df <- ranked %>%
+  mutate(
+    Label_group = case_when(
+      miRNA_dash %in% selected$miRNA_dash ~ "Selected (Borda < 6)",
+      VIMP_positive & Borda_Score == 6   ~ "Excluded (Borda = 6 tie)",
+      VIMP_positive                      ~ "Positive VIMP",
+      TRUE                               ~ "Negative VIMP (noise)"
+    ),
+    Label_group = factor(Label_group,
+                         levels = c("Selected (Borda < 6)",
+                                    "Excluded (Borda = 6 tie)",
+                                    "Positive VIMP",
+                                    "Negative VIMP (noise)"))
+  )
+
+p_rank <- ggplot(plot_df,
+                 aes(x = Rank_MD, y = Rank_VIMP, color = Label_group)) +
+
+  # Selection zone
+  annotate("rect", xmin = 0.5, xmax = 6.5,
+                   ymin = 0.5, ymax = 6.5,
+           fill = "#FFF0F0", alpha = 0.45) +
+  annotate("text", x = 6.4, y = 0.8,
+           label = "Borda < 6\n(selected)",
+           hjust = 1, size = 3,
+           color = "#B22222", fontface = "italic") +
+
+  geom_point(aes(size = 1 / Borda_Score), alpha = 0.85) +
+
+  # Label selected 4
+  geom_label_repel(
+    data          = filter(plot_df, Label_group == "Selected (Borda < 6)"),
+    aes(label     = miRNA_dash),
+    size          = 3,
+    fontface      = "bold",
+    color         = "grey10",
+    fill          = "#FFF0F0",
+    box.padding   = 0.5,
+    point.padding = 0.3,
+    segment.color = "grey60",
+    segment.size  = 0.3,
+    show.legend   = FALSE
+  ) +
+
+  # Label excluded tie pair
+  geom_label_repel(
+    data          = filter(plot_df,
+                           Label_group == "Excluded (Borda = 6 tie)"),
+    aes(label     = miRNA_dash),
+    size          = 2.8,
+    color         = "grey40",
+    fill          = "#FFFBF0",
+    box.padding   = 0.4,
+    point.padding = 0.3,
+    segment.color = "grey70",
+    segment.size  = 0.3,
+    show.legend   = FALSE
+  ) +
+
+  scale_color_manual(
+    values = c("Selected (Borda < 6)"      = "#B22222",
+               "Excluded (Borda = 6 tie)"  = "#A8A8A8",
+               "Positive VIMP"             = "#A8A8A8",
+               "Negative VIMP (noise)"     = "#D0D0D0"),
+    name = NULL
+  ) +
+  scale_size_continuous(range = c(2, 7), guide = "none") +
+
+  scale_x_continuous(breaks = 1:nrow(ranked),
+                     name   = "Minimal depth rank (1 = lowest = best)") +
+  scale_y_continuous(breaks = 1:nrow(ranked),
+                     name   = "VIMP rank (1 = highest = best)") +
+
+  labs(
+    title    = "RSF candidate selection — Borda score < 6",
+    subtitle = paste0(
+      "Borda = (Rank_VIMP + Rank_MD) / 2  |  ",
+      "4 unambiguous candidates selected  |  ",
+      "Borda = 6 tie excluded  |  ",
+      "z-scored ComBat expression"
+    )
+  ) +
+
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position  = "bottom",
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(color = "grey40", size = 9),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("rsf_top4_borda_plot_zscore.png",
+       p_rank, width = 8, height = 7, dpi = 300)
+print(p_rank)
+
+cat("\n4 selected miRNAs for LASSO Cox:\n")
+cat(paste0("  ", selected$miRNA_dash, collapse = "\n"), "\n")
+cat("\nSaved: rsf_full_ranking_borda_zscore.csv\n")
+cat("Saved: rsf_top4_borda_zscore.csv          → input for LASSO Cox\n")
+cat("Saved: rsf_top4_borda_plot_zscore.png\n")
+```
+
+
+#RSF plot top 10
+```{r}
+library(ggplot2)
+library(dplyr)
+library(ggrepel)
+library(patchwork)
+
+# ── Load data ─────────────────────────────────────────────────────
+df       <- read.csv("rsf_full_ranking_borda_zscore.csv")   # UPDATED
+selected <- read.csv("rsf_top4_borda_zscore.csv")           # UPDATED
+
+selected_mirnas <- selected$miRNA
+
+# ── Color scheme ──────────────────────────────────────────────────
+col_selected  <- "#B22222"   # red        — Borda < 6 selected
+col_excluded  <- "#94a3b8"   # amber      — Borda = 6 tie excluded
+col_other_pos <- "#94a3b8"   # grey-blue  — positive VIMP, not selected
+col_neg       <- "#CBD5E1"   # light grey — negative VIMP
+
+# ── Shared color classification ───────────────────────────────────
+add_color_group <- function(data) {
+  data %>%
+    mutate(
+      Color = case_when(
+        miRNA_dash %in% selected_mirnas         ~ "Selected (Borda < 6)",
+        VIMP_positive & Borda_Score == 6        ~ "Excluded (Borda = 6 tie)",
+        VIMP_positive                           ~ "Positive VIMP",
+        TRUE                                    ~ "Negative VIMP (noise)"
+      ),
+      Color = factor(Color,
+                     levels = c("Selected (Borda < 6)",
+                                "Excluded (Borda = 6 tie)",
+                                "Positive VIMP",
+                                "Negative VIMP (noise)"))
+    )
+}
+
+color_values <- c(
+  "Selected (Borda < 6)"     = col_selected,
+  "Excluded (Borda = 6 tie)" = col_excluded,
+  "Positive VIMP"            = col_other_pos,
+  "Negative VIMP (noise)"    = col_neg
+)
+
+# ── Thresholds ────────────────────────────────────────────────────
+# VIMP value at the boundary of selected vs excluded
+vimp_threshold <- df %>%
+  filter(miRNA_dash %in% selected_mirnas) %>%
+  slice_min(VIMP, n = 1) %>%
+  pull(VIMP)
+
+md_threshold <- df %>%
+  filter(miRNA_dash %in% selected_mirnas) %>%
+  slice_max(Minimal_Depth, n = 1) %>%
+  pull(Minimal_Depth)
+
+n_total <- nrow(df)
+
+# ═══════════════════════════════════════════════════════════════════
+# PANEL A: VIMP lollipop
+# ═══════════════════════════════════════════════════════════════════
+vimp_order <- df %>%
+  add_color_group() %>%
+  arrange(VIMP) %>%
+  mutate(miRNA_dash = factor(miRNA_dash, levels = miRNA_dash))
+
+pA <- ggplot(vimp_order, aes(x = VIMP, y = miRNA_dash, color = Color)) +
+
+  geom_segment(aes(x = 0, xend = VIMP, yend = miRNA_dash),
+               linewidth = 0.8) +
+  geom_point(size = 3.5) +
+
+  geom_vline(xintercept = 0,
+             color = "black", linewidth = 0.5) +
+
+  # Selection boundary
+  geom_vline(xintercept = vimp_threshold,
+             linetype = "dashed", color = col_selected,
+             linewidth = 0.6) +
+
+  annotate("text",
+           x = vimp_threshold, y = Inf,
+           label = "",
+           hjust = 1.05, vjust = 1.3,
+           size = 2.8, color = col_selected) +
+
+  geom_text(
+    aes(label = sprintf("%.3f", VIMP),
+        x     = ifelse(VIMP >= 0, VIMP + 0.0009, VIMP - 0.0009),
+        hjust = ifelse(VIMP >= 0, 0, 1)),
+    size = 2.5, color = "grey30"
+  ) +
+
+  scale_color_manual(values = color_values, name = NULL) +
+
+  labs(
+    title    = "A   Variable importance (VIMP)",
+    subtitle = "Ordered by VIMP  |  Dashed = Borda < 6 selection boundary",
+    x        = "VIMP (positive = important, negative = noise)",
+    y        = NULL
+  ) +
+
+  theme_bw(base_size = 10) +
+  theme(
+    legend.position  = "none",
+    plot.title       = element_text(face = "bold", size = 10),
+    plot.subtitle    = element_text(color = "grey40", size = 8),
+    panel.grid.minor = element_blank(),
+    axis.text.y      = element_text(size = 8.5)
+  )
+print(pA)
+# ═══════════════════════════════════════════════════════════════════
+# PANEL B: Minimal depth lollipop
+# ═══════════════════════════════════════════════════════════════════
+md_order <- df %>%
+  add_color_group() %>%
+  arrange(desc(Minimal_Depth)) %>%
+  mutate(miRNA_dash = factor(miRNA_dash, levels = miRNA_dash))
+
+pB <- ggplot(md_order, aes(x = Minimal_Depth, y = miRNA_dash, color = Color)) + 
+  
+  geom_text(
+    aes(label = sprintf("%.2f", Minimal_Depth),
+        x     = Minimal_Depth + 0.005), # Offset to the right
+    hjust = 0, 
+    size  = 2.5, 
+    color = "grey30"
+  ) +
+
+  geom_segment(aes(x    = min(df$Minimal_Depth) * 0.97,
+                   xend = Minimal_Depth,
+                   yend = miRNA_dash),
+               linewidth = 0.8) +
+  geom_point(size = 3.5) +
+
+  geom_vline(xintercept = md_threshold,
+             linetype = "dashed", color = col_selected,
+             linewidth = 0.6) +
+
+  annotate("text",
+           x = md_threshold, y = Inf,
+           label = "",
+           hjust = -0.08, vjust = 1.2,
+           size = 2.8, color = col_selected) +
+
+  scale_color_manual(values = color_values, name = NULL) +
+
+  scale_x_continuous(
+    limits = c(min(df$Minimal_Depth) * 0.96,
+               max(df$Minimal_Depth) * 1.06)
+  ) +
+
+  labs(
+    title    = "B   Minimal depth",
+    subtitle = "Ordered by minimal depth  |  Dashed = Borda < 6 selection boundary",
+    x        = "Minimal depth (smaller = splits earlier = more important)",
+    y        = NULL
+  ) +
+
+  theme_bw(base_size = 10) +
+  theme(
+    legend.position  = "none",
+    plot.title       = element_text(face = "bold", size = 10),
+    plot.subtitle    = element_text(color = "grey40", size = 8),
+    panel.grid.minor = element_blank(),
+    axis.text.y      = element_text(size = 8.5)
+  )
+
+# ═══════════════════════════════════════════════════════════════════
+# PANEL C: Borda score scatter
+# ═══════════════════════════════════════════════════════════════════
+scatter_df <- df %>% add_color_group()
+
+pC <- ggplot(scatter_df, aes(x = Rank_MD, y = Rank_VIMP, color = Color)) +
+
+  # Selection zone — Borda < 6 corresponds roughly to rank sum < 12
+  annotate("rect",
+           xmin = 0.5, xmax = 6.5,
+           ymin = 0.5, ymax = 6.5,
+           fill = "#FFF0F0", alpha = 0.55) +
+  annotate("text",
+           x = 6.4, y = 6.4,
+           label = "",
+           hjust = 1, vjust = 1,
+           size = 2.8, color = col_selected, fontface = "italic") +
+
+  # Borda = 6 boundary lines
+  geom_vline(xintercept = 6.5,
+             linetype = "dashed", color = col_selected,
+             linewidth = 0.5, alpha = 0.7) +
+  geom_hline(yintercept = 6.5,
+             linetype = "dashed", color = col_selected,
+             linewidth = 0.5, alpha = 0.7) +
+
+  geom_point(aes(size = 1 / Borda_Score), alpha = 0.9) +
+
+  # Label selected 4 — bold
+  geom_label_repel(
+    data          = filter(scatter_df, Color == "Selected (Borda < 6)"),
+    aes(label     = miRNA_dash),
+    size          = 2.8,
+    fontface      = "bold",
+    color         = "grey10",
+    fill          = "#FFF0F0",
+    box.padding   = 0.45,
+    point.padding = 0.3,
+    segment.color = "grey60",
+    segment.size  = 0.3,
+    max.overlaps  = 20,
+    show.legend   = FALSE
+  ) +
+
+  # Label excluded tie pair
+  geom_label_repel(
+    data          = filter(scatter_df,
+                           Color == "Excluded (Borda = 6 tie)"),
+    aes(label     = miRNA_dash),
+    size          = 2.5,
+    color         = "grey30",
+    fill          = "#FFFBF0",
+    box.padding   = 0.4,
+    point.padding = 0.3,
+    segment.color = "grey70",
+    segment.size  = 0.3,
+    show.legend   = FALSE
+  ) +
+
+  scale_color_manual(values = color_values, name = NULL) +
+  scale_size_continuous(range = c(2, 7), guide = "none") +
+
+  scale_x_continuous(name   = "Minimal depth rank (1 = lowest = best)",
+                     breaks = seq(1, n_total, by = 1),
+                     limits = c(0.5, n_total + 1)) +
+  scale_y_continuous(name   = "VIMP rank (1 = highest = best)",
+                     breaks = 1:n_total,
+                     limits = c(0.5, n_total + 0.5)) +
+
+  labs(
+    title    = "C   Borda score — candidate selection",
+    subtitle = paste0(
+      "Borda = (Rank_VIMP + Rank_MD) / 2  |  ",
+      "4 miRNAs with Borda < 6 selected  |  ",
+      "Borda = 6 tie excluded"
+    )
+  ) +
+
+  theme_bw(base_size = 10) +
+  theme(
+    legend.position  = "bottom",
+    legend.text      = element_text(size = 8),
+    plot.title       = element_text(face = "bold", size = 10),
+    plot.subtitle    = element_text(color = "grey40", size = 8),
+    panel.grid.minor = element_blank()
+  ) +
+
+  guides(color = guide_legend(override.aes = list(size = 3)))
+
+print(pC)
+# ═══════════════════════════════════════════════════════════════════
+# Combine: A and B stacked left | C full height right
+# ═══════════════════════════════════════════════════════════════════
+combined <- (pA / pB) | pC +
+  plot_layout(widths = c(1, 0.5)) +
+  plot_annotation(
+    title    = "Random Survival Forest — variable importance and candidate selection",
+    subtitle = paste0(
+      "miRNA-only model  |  z-scored ComBat expression  |  ",
+      "4 miRNAs selected (Borda < 6)  |  ",
+      "Borda = 6 tie (miR-30b-5p, miR-1268b) excluded"
+    ),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(color = "grey40", size = 9)
+    )
+  )
+
+ggsave("rsf_final_selection_plot_borda_zscore.png",             # UPDATED
+       combined, width = 14, height = 10, dpi = 300)
+ggsave("rsf_final_selection_plot_borda_zscore.pdf",             # UPDATED
+       combined, width = 14, height = 10)
+
+print(combined)
+cat("Saved: rsf_final_selection_plot_borda_zscore.png / .pdf\n")
+cat("Selected miRNAs:\n")
+cat(paste0("  ", selected_mirnas, collapse = "\n"), "\n")
+```
+
+#LASSO Cox script
+```{r}
+library(survival)
+library(glmnet)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 1: Load data — 4 Borda-selected RSF candidates
+# ═══════════════════════════════════════════════════════════════════
+cox_data <- read.csv("zscore_combat_data_for_Cox.csv")
+
+# UPDATED: load Borda top 4
+rsf_selected <- read.csv("rsf_top4_borda_zscore.csv")
+
+# Convert dash → dot notation to match column names in cox_data
+final_mirnas <- gsub("-", ".", rsf_selected$miRNA)
+
+# Confirm all present
+final_mirnas <- final_mirnas[final_mirnas %in% colnames(cox_data)]
+cat("Confirmed miRNAs in data:", length(final_mirnas), "\n")
+cat(paste(" ", gsub("\\.", "-", final_mirnas), collapse = "\n"), "\n")
+
+# Survival matrix
+X <- as.matrix(cox_data[, final_mirnas])
+y <- Surv(time = cox_data$time, event = cox_data$status)
+
+cat("\nSamples:", nrow(X), "| Events:", sum(cox_data$status), "\n")
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 2: LASSO Cox — 10-fold cross-validation
+# Only 4 input variables — LASSO may retain 2-4
+# lambda.1se enforces maximum parsimony
+# ═══════════════════════════════════════════════════════════════════
+set.seed(42)
+cv_lasso <- cv.glmnet(
+  x      = X,
+  y      = y,
+  family = "cox",
+  alpha  = 1,        # 1 = LASSO
+  nfolds = 10,
+  maxit  = 10000
+)
+
+cat("\n─── LASSO Cross-Validation ───\n")
+cat("lambda.min:", round(cv_lasso$lambda.min, 6), "\n")
+cat("lambda.1se:", round(cv_lasso$lambda.1se, 6), "\n")
+
+# Extract coefficients at both lambdas
+coef_1se <- coef(cv_lasso, s = "lambda.1se")
+coef_min <- coef(cv_lasso, s = "lambda.min")
+
+selected_1se <- rownames(coef_1se)[coef_1se[, 1] != 0]
+selected_min <- rownames(coef_min)[coef_min[, 1] != 0]
+
+cat("\nSelected at lambda.1se (", length(selected_1se), "):",
+    paste(gsub("\\.", "-", selected_1se), collapse = ", "), "\n")
+cat("Selected at lambda.min (", length(selected_min), "):",
+    paste(gsub("\\.", "-", selected_min), collapse = ", "), "\n")
+
+# ── Save LASSO coefficient table ──────────────────────────────────
+lasso_coef_df <- data.frame(
+  miRNA      = final_mirnas,
+  miRNA_dash = gsub("\\.", "-", final_mirnas),
+  coef_1se   = as.numeric(coef_1se[final_mirnas, 1]),
+  coef_min   = as.numeric(coef_min[final_mirnas, 1])
+) %>%
+  mutate(
+    selected_1se = coef_1se != 0,
+    selected_min = coef_min != 0
+  )
+
+write.csv(lasso_coef_df,
+          "LASSO_Cox_coefficients_borda_zscore.csv",          # UPDATED
+          row.names = FALSE)
+print(lasso_coef_df)
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 3: LASSO diagnostic plots
+# ═══════════════════════════════════════════════════════════════════
+pdf("LASSO_diagnostics_borda_zscore.pdf",                     # UPDATED
+    width = 11, height = 5)
+par(mfrow = c(1, 2))
+
+plot(cv_lasso,
+     main = "LASSO Cox — CV partial likelihood deviance")
+abline(v = log(cv_lasso$lambda.min), lty = 2, col = "red",  lwd = 1.5)
+abline(v = log(cv_lasso$lambda.1se), lty = 2, col = "blue", lwd = 1.5)
+legend("topleft",
+       legend = c("lambda.min", "lambda.1se"),
+       col    = c("red", "blue"), lty = 2, cex = 0.85)
+
+plot(cv_lasso$glmnet.fit, xvar = "lambda",
+     main = "LASSO Cox — coefficient path")
+abline(v = log(cv_lasso$lambda.min), lty = 2, col = "red",  lwd = 1.5)
+abline(v = log(cv_lasso$lambda.1se), lty = 2, col = "blue", lwd = 1.5)
+
+dev.off()
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 4: Multivariate Cox on LASSO-selected miRNAs
+# Use lambda.1se — fall back to lambda.min if empty
+# ═══════════════════════════════════════════════════════════════════
+model_mirnas <- if (length(selected_1se) > 0) selected_1se else selected_min
+
+if (length(model_mirnas) == 0) {
+  stop("LASSO selected 0 variables. Try alpha = 0.5 (ElasticNet).")
+}
+
+cat("\n─── Multivariate Cox on LASSO-selected miRNAs ───\n")
+cat("Using:", paste(gsub("\\.", "-", model_mirnas), collapse = ", "), "\n")
+
+formula_str <- paste0(
+  "y ~ `", paste(model_mirnas, collapse = "` + `"), "`"
+)
+
+multi_cox     <- coxph(as.formula(formula_str),
+                        data = cox_data, ties = "efron")
+multi_summary <- summary(multi_cox)
+
+# ── Results table ─────────────────────────────────────────────────
+multi_results <- data.frame(
+  miRNA      = model_mirnas,
+  miRNA_dash = gsub("\\.", "-", model_mirnas),
+  coef       = multi_summary$coefficients[, "coef"],
+  HR         = multi_summary$conf.int[,  "exp(coef)"],
+  HR_lower95 = multi_summary$conf.int[,  "lower .95"],
+  HR_upper95 = multi_summary$conf.int[,  "upper .95"],
+  SE         = multi_summary$coefficients[, "se(coef)"],
+  z          = multi_summary$coefficients[, "z"],
+  p_value    = multi_summary$coefficients[, "Pr(>|z|)"]
+)
+
+cat("\n")
+print(multi_results[, c("miRNA_dash", "coef", "HR",
+                         "HR_lower95", "HR_upper95", "p_value")])
+cat("\nMultivariate Cox C-index:",
+    round(multi_summary$concordance["C"], 3), "\n")
+cat("Model p-value (LRT):     ",
+    round(multi_summary$logtest["pvalue"], 4), "\n")
+
+write.csv(multi_results,
+          "Multivariate_Cox_results_borda_zscore.csv",        # UPDATED
+          row.names = FALSE)
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 5: Forest plot
+# ═══════════════════════════════════════════════════════════════════
+forest_df <- multi_results %>%
+  mutate(
+    miRNA_dash = factor(miRNA_dash, levels = rev(miRNA_dash)),
+    Direction  = ifelse(HR > 1, "Risk (HR > 1)", "Protective (HR < 1)"),
+    annot      = sprintf("HR = %.2f (%.1f\u2013%.1f)   p = %s",
+                          HR, HR_lower95, HR_upper95,
+                          formatC(p_value, digits = 1, format = "g"))
+  )
+
+ci_cap <- max(forest_df$HR_upper95) * 1.3
+
+forest_plot <- ggplot(forest_df,
+                      aes(x = HR, y = miRNA_dash, color = Direction)) +
+
+  geom_vline(xintercept = 1, linetype = "dashed",
+             color = "grey50", linewidth = 0.6) +
+
+  geom_errorbarh(aes(xmin = pmax(HR_lower95, 0.01),
+                     xmax = pmin(HR_upper95, ci_cap)),
+                 height = 0.2, linewidth = 0.8) +
+
+  geom_point(size = 4, shape = 18) +
+
+  geom_text(aes(x = pmin(HR_upper95, ci_cap), label = annot),
+            hjust = -0.05, size = 3, color = "grey20") +
+
+  scale_color_manual(
+    values = c("Risk (HR > 1)"       = "#B22222",
+               "Protective (HR < 1)" = "#1874CD"),
+    name = NULL
+  ) +
+
+  scale_x_continuous(
+    name   = "Hazard Ratio (95% CI) — log scale  |  z-scored expression",
+    trans  = "log10",
+    limits = c(0.2, ci_cap * 3),
+    expand = c(0, 0)
+  ) +
+
+  labs(
+    title    = "Multivariate Cox regression — final model",
+    subtitle = paste0(
+      "4 Borda-selected RSF candidates → LASSO Cox → ", # UPDATED
+      length(model_mirnas), " variables  |  ",
+      "C-index = ", round(multi_summary$concordance["C"], 3),
+      "  |  n = 34, 18 events  |  z-scored ComBat expression"
+    ),
+    y = NULL
+  ) +
+
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position  = "bottom",
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(color = "grey40", size = 9),
+    panel.grid.minor = element_blank(),
+    axis.text.y      = element_text(size = 10)
+  )
+
+
+print(forest_plot)
+
+ggsave("forestplot_multivariate_cox_borda_zscore.png",        # UPDATED
+       forest_plot,
+       width  = 8,
+       height = max(3, 1.5 + length(model_mirnas) * 0.6),
+       dpi    = 300)
+
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 6: Save β coefficients for risk score + TCGA validation
+# β is in SD units — apply to z-scored log2(x+1) TCGA expression
+# ═══════════════════════════════════════════════════════════════════
+beta_table <- multi_results %>%
+  select(miRNA, miRNA_dash, coef, HR,
+         HR_lower95, HR_upper95, p_value) %>%
+  mutate(note = paste0(
+    "Beta from multivariate Cox (z-scored ComBat); ",
+    "apply to z-scored log2(x+1) TCGA expression"
+  ))
+
+write.csv(beta_table,
+          "Final_Cox_betas_for_risk_score_borda_zscore.csv",  # UPDATED
+          row.names = FALSE)
+
+cat("\n═══ Complete ═══\n")
+cat("Files saved:\n")
+cat("  LASSO_Cox_coefficients_borda_zscore.csv\n")
+cat("  LASSO_diagnostics_borda_zscore.pdf\n")
+cat("  Multivariate_Cox_results_borda_zscore.csv\n")
+cat("  Final_Cox_betas_for_risk_score_borda_zscore.csv  ← use for risk score + TCGA\n")
+cat("  forestplot_multivariate_cox_borda_zscore.png\n")
+cat("\nNext step: build risk score using Final_Cox_betas_for_risk_score_borda_zscore.csv\n")
+```
+
+
+#ROC
+```{r}
+library(survival)
+library(survminer)
+library(timeROC)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(patchwork)
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 1: Load data and β coefficients
+# ═══════════════════════════════════════════════════════════════════
+cox_data <- read.csv("zscore_combat_data_for_Cox.csv")            # UPDATED
+betas    <- read.csv("Final_Cox_betas_for_risk_score_borda_zscore.csv") # UPDATED
+
+sig_mirnas <- betas$miRNA   # dot-notation — 3 LASSO-selected miRNAs
+
+cat("Signature miRNAs (3-miRNA signature):\n")                    # UPDATED
+cat(paste(" ", betas$miRNA_dash, "β =", round(betas$coef, 4),
+          collapse = "\n"), "\n")
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 2: Compute risk score
+# Risk = Σ (β_i × z_scored_expression_i)
+# ═══════════════════════════════════════════════════════════════════
+expr_mat   <- as.matrix(cox_data[, sig_mirnas])
+beta_vec   <- betas$coef
+
+risk_score <- as.numeric(expr_mat %*% beta_vec)
+
+risk_df <- cox_data %>%
+  select(SampleID, time, status) %>%
+  mutate(
+    RiskScore = risk_score,
+    RiskGroup = ifelse(RiskScore >= median(RiskScore), "High", "Low"),
+    RiskGroup = factor(RiskGroup, levels = c("Low", "High"))
+  )
+
+cat("\nRisk score range:", round(min(risk_score), 3),
+    "to", round(max(risk_score), 3), "\n")
+cat("Median cutoff:   ", round(median(risk_score), 3), "\n")
+cat("High risk: n =", sum(risk_df$RiskGroup == "High"),
+    "| Low risk: n =", sum(risk_df$RiskGroup == "Low"), "\n")
+cat("High risk events:", sum(risk_df$status[risk_df$RiskGroup == "High"]),
+    "| Low risk events:", sum(risk_df$status[risk_df$RiskGroup == "Low"]), "\n")
+
+write.csv(risk_df, "RiskScore_results_borda_zscore.csv",          # UPDATED
+          row.names = FALSE)
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 3: Kaplan-Meier survival curve
+# ═══════════════════════════════════════════════════════════════════
+surv_obj <- Surv(time = risk_df$time, event = risk_df$status)
+km_fit   <- survfit(surv_obj ~ RiskGroup, data = risk_df)
+
+logrank  <- survdiff(surv_obj ~ RiskGroup, data = risk_df)
+lr_pval  <- 1 - pchisq(logrank$chisq, df = 1)
+
+cat("\nLog-rank p-value:", round(lr_pval, 4), "\n")
+
+km_plot <- ggsurvplot(
+  km_fit,
+  data          = risk_df,
+  palette       = c("#1874CD", "#B22222"),
+  linetype      = c("solid", "solid"),
+  size          = 0.9,
+
+  pval          = FALSE,          # UPDATED: turn off auto p-val — shown in subtitle
+
+  conf.int       = TRUE,
+  conf.int.alpha = 0.12,
+
+  risk.table          = TRUE,
+  risk.table.height   = 0.28,
+  risk.table.fontsize = 3.5,
+  tables.theme        = theme_cleantable(),
+
+  censor.shape = "|",
+  censor.size  = 3.5,
+
+  legend.labs  = c("Low risk", "High risk"),
+  legend.title = "Risk group",
+  xlab         = "Time (months)",
+  ylab         = "Overall survival probability",
+
+  title    = "Kaplan-Meier — 3-miRNA prognostic signature",
+  subtitle = paste0(                                              # UPDATED
+    "hsa-miR-509-3p + hsa-miR-377-3p \u2212 hsa-miR-378h  |  ",
+    "n = 34, 18 events  |  median risk score cutoff  |  ",
+    "Log-rank p = ", formatC(lr_pval, digits = 3, format = "g") # p-value here
+  ),
+
+  xlim             = c(0, max(risk_df$time) + 1),
+  break.time.by    = 6,
+  surv.median.line = "hv",
+
+  ggtheme = theme_bw(base_size = 11) +
+    theme(
+      plot.title      = element_text(face = "bold", size = 12),
+      plot.subtitle   = element_text(color = "grey40", size = 9),
+      legend.position = c(0.82, 0.82)
+    )
+)
+
+# REMOVED: annotate() block — p-value now in subtitle
+
+png("KM_curve_risk_groups_borda_zscore.png",
+    width = 2400, height = 2100, res = 300)
+print(km_plot)
+dev.off()
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 4: Risk score distribution plot
+# ═══════════════════════════════════════════════════════════════════
+risk_df_ord <- risk_df %>%
+  arrange(RiskScore) %>%
+  mutate(Patient_idx = row_number())
+
+p_score <- ggplot(risk_df_ord,
+                  aes(x = Patient_idx, y = RiskScore,
+                      color = RiskGroup, shape = factor(status))) +
+
+  geom_hline(yintercept = median(risk_score),
+             linetype = "dashed", color = "grey40", linewidth = 0.6) +
+
+  geom_point(size = 3, alpha = 0.9) +
+
+  scale_color_manual(values = c("Low" = "#1874CD", "High" = "#B22222"),
+                     name = "Risk group") +
+  scale_shape_manual(values = c("0" = 1, "1" = 16),
+                     labels = c("0" = "Alive (censored)", "1" = "Dead"),
+                     name = "Status") +
+
+  annotate("text",
+           x = 1, y = median(risk_score) + 0.02,
+           label = paste0(),
+           hjust = 0, size = 3, color = "grey30") +
+
+  labs(
+    title    = "Risk score distribution",
+    subtitle = "Sorted by risk score  |  Dashed = median cutoff  |  z-scored expression",
+    x        = "Patients (sorted by risk score)",
+    y        = "Risk score"
+  ) +
+
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 11),
+    plot.subtitle    = element_text(color = "grey40", size = 9),
+    panel.grid.minor = element_blank()
+  )
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 5: Survival status heatmap strip
+# ═══════════════════════════════════════════════════════════════════
+status_tile <- risk_df_ord %>%
+  mutate(status_label = ifelse(status == 1, "Dead", "Alive"))
+
+p_tile <- ggplot(status_tile,
+                 aes(x = Patient_idx, y = 1, fill = status_label)) +
+  geom_tile() +
+  scale_fill_manual(values = c("Dead" = "#B22222", "Alive" = "#1874CD"),
+                    name = "Survival") +
+  geom_vline(xintercept = 17.5,
+             color = "black", linewidth = 0.8) +
+  labs(x = NULL, y = "Status") +
+  theme_bw(base_size = 9) +
+  theme(
+    axis.text       = element_blank(),
+    axis.ticks      = element_blank(),
+    panel.grid      = element_blank(),
+    legend.position = "right",
+    plot.margin     = margin(0, 5, 0, 5)
+  )
+
+combined_score <- p_score / p_tile +
+  plot_layout(heights = c(4, 0.5)) +
+  plot_annotation(
+    title    = "Risk score distribution and survival status",
+    subtitle = paste0(                                             # UPDATED
+      "Risk = 0.743 \u00d7 hsa-miR-509-3p ",
+      "+ 0.503 \u00d7 hsa-miR-377-3p ",
+      "\u2212 0.663 \u00d7 hsa-miR-378h"
+    ),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(color = "grey40", size = 9)
+    )
+  )
+
+ggsave("RiskScore_distribution_borda_zscore.png",                 # UPDATED
+       combined_score, width = 9, height = 6, dpi = 300)
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 6: Time-dependent ROC
+# ═══════════════════════════════════════════════════════════════════
+troc <- timeROC(
+  T      = risk_df$time,
+  delta  = risk_df$status,
+  marker = risk_df$RiskScore,
+  cause  = 1,
+  times  = c(6, 12, 18),
+  iid    = TRUE
+)
+
+auc_df <- data.frame(
+  Timepoint = c(6, 12, 18),
+  AUC       = as.numeric(troc$AUC),
+  AUC_lower = as.numeric(troc$AUC) - 1.96 *
+              as.numeric(troc$inference$vect_sd_1),
+  AUC_upper = as.numeric(troc$AUC) + 1.96 *
+              as.numeric(troc$inference$vect_sd_1)
+)
+
+cat("\n─── Time-dependent ROC AUC ───\n")
+print(auc_df)
+write.csv(auc_df,
+          "TimeROC_AUC_borda_zscore.csv",                        # UPDATED
+          row.names = FALSE)
+
+# ── ROC curves ────────────────────────────────────────────────────
+roc_plot_df <- data.frame(
+  FPR  = c(troc$FP[, 1], troc$FP[, 2], troc$FP[, 3]),
+  TPR  = c(troc$TP[, 1], troc$TP[, 2], troc$TP[, 3]),
+  Time = rep(paste0(c(6, 12, 18), " months"), each = nrow(troc$FP))
+)
+
+auc_labels <- paste0(
+  c(6, 12, 18), " months  AUC = ",
+  round(auc_df$AUC, 3),
+  " (", round(auc_df$AUC_lower, 3),
+  "\u2013", round(auc_df$AUC_upper, 3), ")"
+)
+names(auc_labels) <- paste0(c(6, 12, 18), " months")
+
+p_roc <- ggplot(roc_plot_df,
+                aes(x = FPR, y = TPR, color = Time)) +
+
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "grey60", linewidth = 0.5) +
+
+  geom_line(linewidth = 1) +
+
+  scale_color_manual(
+    values = c("6 months"  = "#B22222",
+               "12 months" = "#E88B00",
+               "18 months" = "#1874CD"),
+    labels = auc_labels,
+    name   = NULL
+  ) +
+
+  scale_x_continuous(name = "1 - Specificity (FPR)",
+                     limits = c(0, 1), expand = c(0.01, 0)) +
+  scale_y_continuous(name = "Sensitivity (TPR)",
+                     limits = c(0, 1), expand = c(0.01, 0)) +
+
+  labs(
+    title    = "Time-dependent ROC — 3-miRNA risk score",        # UPDATED
+    subtitle = "Cause-specific AUC with 95% CI  |  Blanche et al. method"
+  ) +
+
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position   = c(0.62, 0.18),
+    legend.background = element_rect(fill = "white", color = "grey80"),
+    legend.text       = element_text(size = 14),
+    plot.title        = element_text(face = "bold", size = 12),
+    plot.subtitle     = element_text(color = "grey40", size = 9),
+    panel.grid.minor  = element_blank(),
+    aspect.ratio      = 1
+  )
+
+ggsave("TimeROC_curves_borda_zscore.png",                        # UPDATED
+       p_roc, width = 9, height = 6.5, dpi = 300)
+print(p_roc)
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 7: Summary
+# ═══════════════════════════════════════════════════════════════════
+cat("\n═══ Risk score analysis complete ═══\n")
+cat("\n3-miRNA risk score formula:\n")                            # UPDATED
+cat("  Risk = 0.743 × hsa-miR-509-3p\n")
+cat("       + 0.503 × hsa-miR-377-3p\n")
+cat("       - 0.663 × hsa-miR-378h\n")
+cat("\nLog-rank p-value:", round(lr_pval, 4), "\n")
+cat("Time-ROC AUC:\n")
+for (i in 1:nrow(auc_df)) {
+  cat(sprintf("  %2d months: %.3f (%.3f\u2013%.3f)\n",
+              auc_df$Timepoint[i],
+              auc_df$AUC[i],
+              auc_df$AUC_lower[i],
+              auc_df$AUC_upper[i]))
+}
+cat("\nFiles saved:\n")
+cat("  RiskScore_results_borda_zscore.csv\n")
+cat("  KM_curve_risk_groups_borda_zscore.png\n")
+cat("  RiskScore_distribution_borda_zscore.png\n")
+cat("  TimeROC_curves_borda_zscore.png\n")
+cat("  TimeROC_AUC_borda_zscore.csv\n")
+cat("\nNext step: TCGA external validation\n")
+```
+
+#improved KM
+```{r}
+# ── 3-miRNA KM plot ───────────────────────────────────────────────
+surv_obj <- Surv(time = risk_df$time, event = risk_df$status)
+km_fit   <- survfit(surv_obj ~ RiskGroup, data = risk_df)
+logrank  <- survdiff(surv_obj ~ RiskGroup, data = risk_df)
+lr_pval  <- 1 - pchisq(logrank$chisq, df = 1)
+
+# ── Compute HR for risk group (High vs Low) dynamically ───────────
+# Do NOT hardcode — recompute from actual data
+hr_model   <- coxph(surv_obj ~ RiskGroup, data = risk_df)
+hr_summary <- summary(hr_model)
+hr_val     <- hr_summary$conf.int[1, "exp(coef)"]
+hr_lo      <- hr_summary$conf.int[1, "lower .95"]
+hr_hi      <- hr_summary$conf.int[1, "upper .95"]
+
+cat("Risk group HR (High vs Low):",
+    round(hr_val, 2),
+    "(", round(hr_lo, 2), "-", round(hr_hi, 2), ")\n")
+cat("Log-rank p:", round(lr_pval, 4), "\n")
+
+km_plot <- ggsurvplot(
+  km_fit,
+  data    = risk_df,
+  palette = c("#1874CD", "#B22222"),
+  size    = 0.9,
+
+  # P-value — turn off auto, shown in annotate below
+  pval   = FALSE,
+
+  # Confidence interval
+  conf.int       = TRUE,
+  conf.int.alpha = 0.12,
+
+  # Risk table
+  risk.table          = TRUE,
+  risk.table.height   = 0.28,
+  risk.table.fontsize = 5,
+  risk.table.y.text   = FALSE,
+  tables.theme        = theme_cleantable(),
+
+  # Censoring
+  censor.shape = "|",
+  censor.size  = 4,
+
+  # Median lines
+  surv.median.line = "hv",
+
+  # Legend
+  legend.labs  = c("Low risk  (n=17)", "High risk  (n=17)"),
+  legend.title = "",
+
+  # Axes
+  xlab          = "Time (months)",
+  ylab          = "Overall survival probability",
+  xlim          = c(0, 30),
+  break.time.by = 6,
+  ylim          = c(0, 1.02),
+
+  # Title — UPDATED: 3-miRNA
+  title = "Kaplan-Meier — 3-miRNA prognostic signature",
+
+  ggtheme = theme_bw(base_size = 11) +
+    theme(
+      plot.title        = element_text(face = "bold", size = 12),
+      plot.subtitle     = element_text(color = "grey40", size = 9),
+      legend.position   = c(0.80, 0.82),
+      legend.background = element_rect(fill  = "white",
+                                       color = "grey80",
+                                       linewidth = 0.4)
+    )
+)
+
+# ── HR + p-value annotation — UPDATED: dynamic values ─────────────
+km_plot$plot <- km_plot$plot +
+  annotate("text",
+           x     = -1.3, y = 0.1,
+           label = paste0(
+             "HR = ", round(hr_val, 2),
+             " (", round(hr_lo, 2),
+             "\u2013", round(hr_hi, 2), ")\n",
+             "Log-rank p = ",
+             formatC(lr_pval, digits = 2, format = "g")
+           ),
+           hjust = 0, size = 3.4, color = "grey20") +
+  labs(
+    subtitle = paste0(                                  # UPDATED subtitle
+      "hsa-miR-509-3p + hsa-miR-377-3p \u2212 hsa-miR-378h  |  ",
+      "z-scored ComBat expression  |  median risk score cutoff"
+    )
+  )
+
+# ── Save ──────────────────────────────────────────────────────────
+png("KM_curve_risk_groups_borda_zscore.png",
+    width = 2400, height = 2100, res = 300)
+print(km_plot)
+dev.off()
+
+pdf("KM_curve_risk_groups_borda_zscore.pdf",
+    width = 8, height = 7)
+print(km_plot)
+dev.off()
+
+cat("KM plot saved\n")
+```
+#improved KM with out label
+```{r}
+# ── 3-miRNA KM plot ───────────────────────────────────────────────
+surv_obj <- Surv(time = risk_df$time, event = risk_df$status)
+km_fit   <- survfit(surv_obj ~ RiskGroup, data = risk_df)
+logrank  <- survdiff(surv_obj ~ RiskGroup, data = risk_df)
+lr_pval  <- 1 - pchisq(logrank$chisq, df = 1)
+
+# ── Compute HR for risk group (High vs Low) dynamically ───────────
+# Do NOT hardcode — recompute from actual data
+hr_model   <- coxph(surv_obj ~ RiskGroup, data = risk_df)
+hr_summary <- summary(hr_model)
+hr_val     <- hr_summary$conf.int[1, "exp(coef)"]
+hr_lo      <- hr_summary$conf.int[1, "lower .95"]
+hr_hi      <- hr_summary$conf.int[1, "upper .95"]
+
+cat("Risk group HR (High vs Low):",
+    round(hr_val, 2),
+    "(", round(hr_lo, 2), "-", round(hr_hi, 2), ")\n")
+cat("Log-rank p:", round(lr_pval, 4), "\n")
+
+km_plot <- ggsurvplot(
+  km_fit,
+  data    = risk_df,
+  palette = c("#1874CD", "#B22222"),
+  size    = 0.9,
+
+  # P-value — turn off auto, shown in annotate below
+  pval   = FALSE,
+
+  # Confidence interval
+  conf.int       = TRUE,
+  conf.int.alpha = 0.12,
+
+  # Risk table
+  risk.table          = TRUE,
+  risk.table.height   = 0.28,
+  risk.table.fontsize = 7,
+  risk.table.y.text   = FALSE,
+  tables.theme        = theme_cleantable(),
+
+  # Censoring
+  censor.shape = "|",
+  censor.size  = 4,
+
+  # Median lines
+  surv.median.line = "hv",
+
+  # Legend
+  legend.labs  = c("Low risk  (n=17)", "High risk  (n=17)"),
+  legend.title = "",
+
+  # Axes
+  xlab          = "Time (months)",
+  ylab          = "Overall survival probability",
+  xlim          = c(0, 30),
+  break.time.by = 6,
+  ylim          = c(0, 1.02),
+
+  # Title — UPDATED: 3-miRNA
+  title = "Kaplan-Meier — 3-miRNA prognostic signature",
+
+  ggtheme = theme_bw(base_size = 11) +
+    theme(
+      plot.title        = element_text(face = "bold", size = 12),
+      plot.subtitle     = element_text(color = "grey40", size = 9),
+      legend.position   = c(0.80, 0.82),
+      legend.background = element_rect(fill  = "white",
+                                       color = "grey80",
+                                       linewidth = 0.4)
+    )
+)
+
+# ── HR + p-value annotation — UPDATED: dynamic values ─────────────
+km_plot$plot <- km_plot$plot +
+  annotate("text",
+           x     = -1.3, y = 0.1,
+           label = paste0(),
+           hjust = 0, size = 3.4, color = "grey20") +
+  labs(
+    subtitle = paste0(                                  # UPDATED subtitle
+      "hsa-miR-509-3p + hsa-miR-377-3p \u2212 hsa-miR-378h  |  ",
+      "z-scored ComBat expression  |  median risk score cutoff"
+    )
+  )
+
+# ── Save ──────────────────────────────────────────────────────────
+png("KM_curve_risk_groups_borda_zscore.png",
+    width = 2400, height = 2100, res = 300)
+print(km_plot)
+dev.off()
+
+pdf("KM_curve_risk_groups_borda_zscore.pdf",
+    width = 8, height = 7)
+print(km_plot)
+dev.off()
+
+cat("KM plot saved\n")
+```
+
+
+#multi clinical 
+```{r}
+library(survival)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(forestplot)
+library(ggrepel)
+library(grid)
+
+select    <- dplyr::select
+filter    <- dplyr::filter
+mutate    <- dplyr::mutate
+rename    <- dplyr::rename
+left_join <- dplyr::left_join
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 1: Load data
+# ═══════════════════════════════════════════════════════════════════
+metadata <- read.csv("Metadata_Limma_dead_time_all.csv")
+risk_df  <- read.csv("RiskScore_results_borda_zscore.csv")     # UPDATED
+
+clin <- metadata %>%
+  left_join(dplyr::select(risk_df, SampleID, RiskScore, RiskGroup),
+            by = "SampleID") %>%
+  mutate(
+    age_bin     = ifelse(Age == ">=60", 1, 0),                 # ADDED
+    sex_bin     = ifelse(sex == "Male", 1, 0),
+    smoking_bin = ifelse(smoking == "never smoker", 0, 1),
+    stage_bin   = ifelse(stage == 4, 1, 0),
+    adeno_bin   = ifelse(histo_detail == "Adenocarcinoma", 1, 0),
+    risk_bin    = ifelse(RiskGroup == "High", 1, 0),
+    time        = as.numeric(Time.Dead),
+    status      = as.integer(dead.status)
+  )
+
+cat("Samples:", nrow(clin), "| Events:", sum(clin$status), "\n")
+cat("Age distribution:\n");   print(table(clin$Age,       useNA = "ifany"))
+cat("Stage distribution:\n"); print(table(clin$stage_bin, useNA = "ifany"))
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 2: Univariate Cox
+# ═══════════════════════════════════════════════════════════════════
+surv_obj <- Surv(time = clin$time, event = clin$status)
+
+vars <- list(
+  list(var = "age_bin",     label = "Age (\u226560 vs <60)"),  # ADDED
+  list(var = "sex_bin",     label = "Sex (Male vs Female)"),
+  list(var = "smoking_bin", label = "Smoking (Ever vs Never)"),
+  list(var = "stage_bin",   label = "Stage (IV vs III)"),
+  list(var = "adeno_bin",   label = "Histology (Adeno vs Other)"),
+  list(var = "RiskScore",   label = "3-miRNA risk score (continuous)") # UPDATED
+)
+
+uni_list <- lapply(vars, function(v) {
+  tryCatch({
+    fit <- coxph(as.formula(paste0("surv_obj ~ ", v$var)),
+                 data = clin, ties = "efron")
+    s   <- summary(fit)
+    data.frame(
+      Variable   = v$label,
+      var_name   = v$var,
+      HR         = s$conf.int[1, "exp(coef)"],
+      HR_lower95 = s$conf.int[1, "lower .95"],
+      HR_upper95 = s$conf.int[1, "upper .95"],
+      p_value    = s$coefficients[1, "Pr(>|z|)"],
+      stringsAsFactors = FALSE
+    )
+  }, error = function(e) {
+    message("Skipped ", v$label, ": ", e$message)
+    data.frame(Variable = v$label, var_name = v$var,
+               HR = NA, HR_lower95 = NA, HR_upper95 = NA, p_value = NA)
+  })
+})
+
+uni_results <- bind_rows(uni_list)
+
+cat("\n─── Univariate Cox results ───\n")
+print(uni_results %>%
+  mutate(across(c(HR, HR_lower95, HR_upper95), ~round(., 3)),
+         p_value = round(p_value, 4)))
+
+write.csv(uni_results,
+          "Univariate_clinical_Cox_borda_zscore.csv",          # UPDATED
+          row.names = FALSE)
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 3: Multivariate Cox
+# ═══════════════════════════════════════════════════════════════════
+clin_vars_sig <- uni_results %>%
+  dplyr::filter(var_name != "RiskScore", !is.na(p_value), p_value < 0.10) %>%
+  dplyr::pull(var_name)
+
+cat("\nClinical variables entering multivariate (p<0.10):",
+    paste(clin_vars_sig, collapse = ", "), "\n")
+
+multi_vars    <- c("RiskScore", clin_vars_sig)
+cat("Final multivariate variables:", paste(multi_vars, collapse = ", "), "\n")
+
+multi_formula <- as.formula(
+  paste0("surv_obj ~ ", paste(multi_vars, collapse = " + "))
+)
+multi_fit     <- coxph(multi_formula, data = clin, ties = "efron")
+multi_summary <- summary(multi_fit)
+
+cat("\n─── Multivariate Cox results ───\n")
+print(multi_summary)
+cat("\nMultivariate C-index:", round(multi_summary$concordance["C"], 3), "\n")
+cat("LRT p-value:         ", round(multi_summary$logtest["pvalue"], 4), "\n")
+
+var_labels <- c(
+  "RiskScore"   = "3-miRNA risk score",                        # UPDATED
+  "age_bin"     = "Age (\u226560 vs <60)",                     # ADDED
+  "sex_bin"     = "Sex (Male vs Female)",
+  "smoking_bin" = "Smoking (Ever vs Never)",
+  "stage_bin"   = "Stage (IV vs III)",
+  "adeno_bin"   = "Histology (Adeno vs Other)"
+)
+
+multi_results <- data.frame(
+  Variable   = var_labels[rownames(multi_summary$coefficients)],
+  var_name   = rownames(multi_summary$coefficients),
+  HR         = multi_summary$conf.int[, "exp(coef)"],
+  HR_lower95 = multi_summary$conf.int[, "lower .95"],
+  HR_upper95 = multi_summary$conf.int[, "upper .95"],
+  p_value    = multi_summary$coefficients[, "Pr(>|z|)"]
+) %>%
+  mutate(
+    sig = case_when(
+      p_value < 0.001 ~ "***",
+      p_value < 0.01  ~ "**",
+      p_value < 0.05  ~ "*",
+      p_value < 0.10  ~ ".",
+      TRUE            ~ ""
+    )
+  )
+
+cat("\n─── Multivariate Cox clean results ───\n")
+print(multi_results %>%
+  mutate(across(c(HR, HR_lower95, HR_upper95), ~round(., 3)),
+         p_value = round(p_value, 4)))
+
+write.csv(multi_results,
+          "Multivariate_clinical_Cox_borda_zscore.csv",        # UPDATED
+          row.names = FALSE)
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 4: Shared data preparation for both forest plots
+# ═══════════════════════════════════════════════════════════════════
+forest_df <- uni_results %>%
+  dplyr::rename(HR_uni = HR, lo_uni = HR_lower95,
+                hi_uni = HR_upper95, p_uni = p_value) %>%
+  left_join(
+    dplyr::select(multi_results,
+                  var_name, HR_mul = HR, lo_mul = HR_lower95,
+                  hi_mul = HR_upper95, p_mul = p_value),
+    by = "var_name"
+  ) %>%
+  arrange(var_name == "RiskScore")   # RiskScore last
+
+n_rows <- nrow(forest_df)
+
+fmt_p  <- function(p) ifelse(is.na(p), "\u2014",
+                              ifelse(p < 0.001, "<0.001",
+                                     sprintf("%.3f", p)))
+fmt_hr <- function(hr, lo, hi) ifelse(is.na(hr), "\u2014",
+                                       sprintf("%.2f (%.2f\u2013%.2f)",
+                                               hr, lo, hi))
+
+# ═══════════════════════════════════════════════════════════════════
+# PLOT A: Plain forestplot (publication-ready classic style)
+# ═══════════════════════════════════════════════════════════════════
+label_text <- cbind(
+  c("Variable",          forest_df$Variable),
+  c("Uni HR (95% CI)",   fmt_hr(forest_df$HR_uni, forest_df$lo_uni, forest_df$hi_uni)),
+  c("Uni p",             fmt_p(forest_df$p_uni)),
+  c("Multi HR (95% CI)", fmt_hr(forest_df$HR_mul, forest_df$lo_mul, forest_df$hi_mul)),
+  c("Multi p",           fmt_p(forest_df$p_mul))
+)
+
+# Plot UNIVARIATE HR as the main point in plain style
+hr_vec   <- c(NA, forest_df$HR_uni)
+ci_lower <- c(NA, forest_df$lo_uni)
+ci_upper <- c(NA, forest_df$hi_uni)
+
+box_colors_plain <- c(
+  "black",
+  ifelse(forest_df$var_name == "RiskScore", "#B22222", "#1874CD")
+)
+
+fp_args_plain <- list(
+  labeltext          = label_text,
+  mean               = hr_vec,
+  lower              = ci_lower,
+  upper              = ci_upper,
+  is.summary         = c(TRUE, rep(FALSE, n_rows)),
+  zero               = 1,
+  xlog               = TRUE,
+  clip               = c(0.05, 20),
+  xticks             = c(0.1, 0.5, 1, 2, 5, 10),
+  xlab               = "Hazard Ratio (log scale) — Univariate",
+  boxsize            = 0.22,
+  lineheight         = unit(9, "mm"),
+  ci.vertices        = TRUE,
+  ci.vertices.height = 0.12,
+  grid               = TRUE,
+  grid.gp            = gpar(lty = 2, col = "grey80", lwd = 0.7),
+  col = fpColors(
+    box     = box_colors_plain,
+    line    = "grey30",
+    zero    = "black",
+    summary = "grey50"
+  ),
+  title = paste0(
+    "Univariate and multivariate Cox regression\n",
+    "n = 34  |  18 events  |  Red = 3-miRNA risk score  |  z-scored ComBat expression"
+  ),
+  txt_gp = fpTxtGp(
+    label   = gpar(fontsize = 9),
+    ticks   = gpar(fontsize = 8),
+    xlab    = gpar(fontsize = 9),
+    title   = gpar(fontsize = 10, fontface = "bold"),
+    summary = gpar(fontsize = 9, fontface = "bold")
+  ),
+  colgap     = unit(2, "mm"),
+  graphwidth = unit(45, "mm"),
+  align      = c("l", "c", "c", "c", "c")
+)
+
+pdf_h <- max(4, 1.8 + n_rows * 0.4)
+pdf("forestplot_clinical_plain_borda_zscore.pdf",              # UPDATED
+    width = 14, height = pdf_h)
+do.call(forestplot, fp_args_plain)
+dev.off()
+
+png_h <- max(400, 200 + n_rows * 45)
+png("forestplot_clinical_plain_borda_zscore.png",              # UPDATED
+    width = 1500, height = png_h, res = 130)
+do.call(forestplot, fp_args_plain)
+dev.off()
+cat("Plain forest plot saved\n")
+
+# ═══════════════════════════════════════════════════════════════════
+# PLOT B: Colored ggplot style — two panels (Univariate | Multivariate)
+# ═══════════════════════════════════════════════════════════════════
+library(patchwork)
+
+# Color logic
+forest_df <- forest_df %>%
+  mutate(
+    Type = case_when(
+      var_name == "RiskScore" ~ "3-miRNA Risk Score",
+      TRUE                    ~ "Clinical Variable"
+    ),
+    # Direction from multivariate (NA if not in model)
+    Direction_mul = case_when(
+      is.na(HR_mul)  ~ "Not in model",
+      HR_mul > 1     ~ "Risk (HR > 1)",
+      TRUE           ~ "Protective (HR < 1)"
+    ),
+    Direction_uni = case_when(
+      is.na(HR_uni) ~ "Not tested",
+      HR_uni > 1    ~ "Risk (HR > 1)",
+      TRUE          ~ "Protective (HR < 1)"
+    ),
+    # Display label
+    label     = factor(Variable, levels = rev(Variable)),
+    sig_uni   = ifelse(p_uni < 0.05, "*", ""),
+    sig_mul   = ifelse(!is.na(p_mul) & p_mul < 0.05, "*", ""),
+    annot_uni = paste0("HR=", round(HR_uni, 2),
+                       " (", round(lo_uni, 2), "\u2013", round(hi_uni, 2), ")",
+                       "  p=", fmt_p(p_uni)),
+    annot_mul = ifelse(is.na(HR_mul), "Not in model",
+                       paste0("HR=", round(HR_mul, 2),
+                              " (", round(lo_mul, 2), "\u2013",
+                              round(hi_mul, 2), ")",
+                              "  p=", fmt_p(p_mul)))
+  )
+
+# Shared color scale
+color_vals <- c(
+  "Risk (HR > 1)"       = "#B22222",
+  "Protective (HR < 1)" = "#1874CD",
+  "Not in model"        = "grey70",
+  "Not tested"          = "grey70"
+)
+
+ci_cap_uni <- quantile(forest_df$hi_uni, 0.95, na.rm = TRUE) * 1.5
+ci_cap_mul <- ifelse(all(is.na(forest_df$hi_mul)), ci_cap_uni,
+                     quantile(forest_df$hi_mul, 0.95, na.rm = TRUE) * 1.5)
+
+# ── Panel A: Univariate ───────────────────────────────────────────
+pA <- ggplot(forest_df,
+             aes(x = HR_uni, y = label, color = Direction_uni)) +
+
+  geom_vline(xintercept = 1, linetype = "dashed",
+             color = "grey50", linewidth = 0.6) +
+
+  geom_errorbarh(
+    aes(xmin = pmax(lo_uni, 0.01),
+        xmax = pmin(hi_uni, ci_cap_uni)),
+    height = 0.3, linewidth = 0.7
+  ) +
+
+  geom_point(aes(shape = Type), size = 3.5) +
+
+  geom_text(
+    aes(x = pmin(hi_uni, ci_cap_uni) + 0.05,
+        label = annot_uni),
+    hjust = 0, size = 2.6, color = "grey20"
+  ) +
+
+  scale_color_manual(values = color_vals, name = NULL) +
+  scale_shape_manual(
+    values = c("3-miRNA Risk Score" = 18,
+               "Clinical Variable"  = 16),
+    name = NULL
+  ) +
+
+  scale_x_continuous(
+    name   = "Hazard Ratio (95% CI) — log scale",
+    trans  = "log10",
+    limits = c(0.1, ci_cap_uni * 3),
+    expand = c(0, 0)
+  ) +
+
+  labs(
+    title    = "A   Univariate Cox",
+    subtitle = "All clinical variables + 3-miRNA risk score",
+    y        = NULL
+  ) +
+
+  theme_bw(base_size = 10) +
+  theme(
+    legend.position  = "bottom",
+    plot.title       = element_text(face = "bold", size = 10),
+    plot.subtitle    = element_text(color = "grey40", size = 8),
+    panel.grid.minor = element_blank(),
+    axis.text.y      = element_text(size = 9)
+  )
+
+# ── Panel B: Multivariate ─────────────────────────────────────────
+pB <- ggplot(forest_df,
+             aes(x = HR_mul, y = label, color = Direction_mul)) +
+
+  geom_vline(xintercept = 1, linetype = "dashed",
+             color = "grey50", linewidth = 0.6) +
+
+  # Grey band for "not in model" rows
+  geom_rect(
+    data = filter(forest_df, is.na(HR_mul)),
+    aes(xmin = 0.1, xmax = ci_cap_mul * 3,
+        ymin = as.numeric(label) - 0.4,
+        ymax = as.numeric(label) + 0.4),
+    fill = "grey96", color = NA, inherit.aes = FALSE
+  ) +
+
+  geom_errorbarh(
+    data = filter(forest_df, !is.na(HR_mul)),
+    aes(xmin = pmax(lo_mul, 0.01),
+        xmax = pmin(hi_mul, ci_cap_mul)),
+    height = 0.3, linewidth = 0.7
+  ) +
+
+  geom_point(
+    data = filter(forest_df, !is.na(HR_mul)),
+    aes(shape = Type), size = 3.5
+  ) +
+
+  # "Not in model" label for excluded rows
+  geom_text(
+    data = filter(forest_df, is.na(HR_mul)),
+    aes(x = 1, y = label, label = "Not in model"),
+    hjust = 0.5, size = 2.8, color = "grey60", inherit.aes = FALSE
+  ) +
+
+  geom_text(
+    data = filter(forest_df, !is.na(HR_mul)),
+    aes(x = pmin(hi_mul, ci_cap_mul) + 0.05,
+        label = annot_mul),
+    hjust = 0, size = 2.6, color = "grey20"
+  ) +
+
+  scale_color_manual(values = color_vals, name = NULL) +
+  scale_shape_manual(
+    values = c("3-miRNA Risk Score" = 18,
+               "Clinical Variable"  = 16),
+    name = NULL
+  ) +
+
+  scale_x_continuous(
+    name   = "Hazard Ratio (95% CI) — log scale",
+    trans  = "log10",
+    limits = c(0.1, ci_cap_mul * 3),
+    expand = c(0, 0)
+  ) +
+
+  labs(
+    title    = "B   Multivariate Cox",
+    subtitle = "Adjusted for clinical variables with p < 0.10 in univariate",
+    y        = NULL
+  ) +
+
+  theme_bw(base_size = 10) +
+  theme(
+    legend.position  = "bottom",
+    plot.title       = element_text(face = "bold", size = 10),
+    plot.subtitle    = element_text(color = "grey40", size = 8),
+    panel.grid.minor = element_blank(),
+    axis.text.y      = element_text(size = 9)
+  )
+
+# ── Combine ───────────────────────────────────────────────────────
+combined_forest <- pA | pB +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+combined_forest <- combined_forest +
+  plot_annotation(
+    title    = "Clinical independence — univariate and multivariate Cox regression",
+    subtitle = paste0(
+      "n = 34  |  18 events  |  3-miRNA risk score (diamond)  |  ",
+      "z-scored ComBat expression  |  Clinical variables (circle)"
+    ),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(color = "grey40", size = 9)
+    )
+  )
+
+plot_h <- max(5, 1.8 + n_rows * 0.5)
+ggsave("forestplot_clinical_colored_borda_zscore.png",         # UPDATED
+       combined_forest, width = 16, height = plot_h, dpi = 300)
+ggsave("forestplot_clinical_colored_borda_zscore.pdf",         # UPDATED
+       combined_forest, width = 16, height = plot_h)
+
+print(combined_forest)
+cat("Colored forest plot saved\n")
+
+cat("\n═══ Complete ═══\n")
+cat("Files saved:\n")
+cat("  Univariate_clinical_Cox_borda_zscore.csv\n")
+cat("  Multivariate_clinical_Cox_borda_zscore.csv\n")
+cat("  forestplot_clinical_plain_borda_zscore.pdf/png   ← classic style\n")
+cat("  forestplot_clinical_colored_borda_zscore.pdf/png ← ggplot colored style\n")
+```
+
+
+#forest plot clinical 
+```{r}
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+# ═══════════════════════════════════════════════════════════════════
+# Shared helpers
+# ═══════════════════════════════════════════════════════════════════
+fmt_p <- function(p) ifelse(is.na(p), "—",
+                             ifelse(p < 0.001, "<0.001",
+                                    formatC(p, digits = 2, format = "g")))
+
+# ═══════════════════════════════════════════════════════════════════
+# PLOT A: Univariate forest plot
+# ═══════════════════════════════════════════════════════════════════
+uni_df <- uni_results %>%
+  filter(!is.na(HR)) %>%
+  mutate(
+    Variable  = factor(Variable, levels = rev(Variable)),
+    Direction = ifelse(HR > 1, "Risk (HR > 1)", "Protective (HR < 1)"),
+    annot     = sprintf("HR = %.2f (%.2f\u2013%.2f)   p = %s",
+                        HR, HR_lower95, HR_upper95,
+                        fmt_p(p_value)),
+    is_score  = var_name == "RiskScore"
+  )
+
+ci_cap_uni <- max(uni_df$HR_upper95, na.rm = TRUE) * 1.3
+
+pA <- ggplot(uni_df, aes(x = HR, y = Variable, color = Direction)) +
+
+  geom_vline(xintercept = 1, linetype = "dashed",
+             color = "grey50", linewidth = 0.6) +
+
+  geom_errorbarh(
+    aes(xmin = pmax(HR_lower95, 0.01),
+        xmax = pmin(HR_upper95, ci_cap_uni)),
+    height = 0.25, linewidth = 0.8
+  ) +
+
+  # Diamond for risk score, circle for clinical
+  geom_point(data = filter(uni_df, !is_score),
+             size = 4, shape = 16) +
+  geom_point(data = filter(uni_df,  is_score),
+             size = 5, shape = 18) +
+
+  geom_text(
+    aes(x     = pmin(HR_upper95, ci_cap_uni),
+        label = annot),
+    hjust = -0.05, size = 3, color = "grey20"
+  ) +
+
+  scale_color_manual(
+    values = c("Risk (HR > 1)"       = "#B22222",
+               "Protective (HR < 1)" = "#1874CD"),
+    name = NULL
+  ) +
+
+  scale_x_continuous(
+    name   = "Hazard Ratio (95% CI) — log scale",
+    trans  = "log10",
+    limits = c(0.3, ci_cap_uni * 2),
+    expand = c(0, 0)
+  ) +
+
+  labs(
+    title    = "A   Univariate Cox regression",
+    subtitle = paste0(
+      "n = 34  |  18 events  |  ",
+      "Diamond = 3-miRNA risk score  |  z-scored ComBat expression"
+    ),
+    y = NULL
+  ) +
+
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position  = "bottom",
+    plot.title       = element_text(face = "bold", size = 11),
+    plot.subtitle    = element_text(color = "grey40", size = 9),
+    panel.grid.minor = element_blank(),
+    axis.text.y      = element_text(size = 10)
+  )
+
+print(pA)
+# ═══════════════════════════════════════════════════════════════════
+# PLOT B: Multivariate forest plot
+# ═══════════════════════════════════════════════════════════════════
+multi_df <- multi_results %>%
+  filter(!is.na(HR)) %>%
+  mutate(
+    Variable  = factor(Variable, levels = rev(Variable)),
+    Direction = ifelse(HR > 1, "Risk (HR > 1)", "Protective (HR < 1)"),
+    annot     = sprintf("HR = %.2f (%.2f\u2013%.2f)   p = %s",
+                        HR, HR_lower95, HR_upper95,
+                        fmt_p(p_value)),
+    is_score  = var_name == "RiskScore"
+  )
+
+ci_cap_mul <- max(multi_df$HR_upper95, na.rm = TRUE) * 1.3
+
+pB <- ggplot(multi_df, aes(x = HR, y = Variable, color = Direction)) +
+
+  geom_vline(xintercept = 1, linetype = "dashed",
+             color = "grey50", linewidth = 0.6) +
+
+  geom_errorbarh(
+    aes(xmin = pmax(HR_lower95, 0.01),
+        xmax = pmin(HR_upper95, ci_cap_mul)),
+    height = 0.25, linewidth = 0.8
+  ) +
+
+  geom_point(data = filter(multi_df, !is_score),
+             size = 4, shape = 16) +
+  geom_point(data = filter(multi_df,  is_score),
+             size = 5, shape = 18) +
+
+  geom_text(
+    aes(x     = pmin(HR_upper95, ci_cap_mul),
+        label = annot),
+    hjust = -0.05, size = 3, color = "grey20"
+  ) +
+
+  scale_color_manual(
+    values = c("Risk (HR > 1)"       = "#B22222",
+               "Protective (HR < 1)" = "#1874CD"),
+    name = NULL
+  ) +
+
+  scale_x_continuous(
+    name   = "Hazard Ratio (95% CI) — log scale",
+    trans  = "log10",
+    limits = c(0.1, ci_cap_mul * 4),
+    expand = c(0, 0)
+  ) +
+
+  labs(
+    title    = "B   Multivariate Cox regression",
+    subtitle = paste0(
+      "Adjusted for clinical variables with p < 0.10 in univariate  |  ",
+      "C-index = ", round(multi_summary$concordance["C"], 3),
+      "  |  n = 34, 18 events"
+    ),
+    y = NULL
+  ) +
+
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position  = "bottom",
+    plot.title       = element_text(face = "bold", size = 11),
+    plot.subtitle    = element_text(color = "grey40", size = 9),
+    panel.grid.minor = element_blank(),
+    axis.text.y      = element_text(size = 10)
+  )
+
+# ═══════════════════════════════════════════════════════════════════
+# Save individually
+# ═══════════════════════════════════════════════════════════════════
+uni_h   <- max(3, 1.5 + nrow(uni_df)   * 0.55)
+multi_h <- max(3, 1.5 + nrow(multi_df) * 0.55)
+
+ggsave("forestplot_univariate_clinical_borda_zscore.png",
+       pA, width = 10, height = uni_h, dpi = 300)
+ggsave("forestplot_multivariate_clinical_borda_zscore.png",
+       pB, width = 11, height = multi_h, dpi = 300)
+
+# ═══════════════════════════════════════════════════════════════════
+# Combined A / B stacked
+# ═══════════════════════════════════════════════════════════════════
+combined <- pA / pB +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+combined <- combined +
+  plot_annotation(
+    title    = "Clinical independence — Cox regression",
+    subtitle = paste0(
+      "3-miRNA risk score (hsa-miR-509-3p, hsa-miR-377-3p, hsa-miR-378h)  |  ",
+      "z-scored ComBat-corrected expression  |  n = 34, 18 events"
+    ),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(color = "grey40", size = 9)
+    )
+  )
+
+combined_h <- max(7, uni_h + multi_h + 1)
+
+ggsave("forestplot_clinical_combined_borda_zscore.png",
+       combined, width = 11, height = combined_h, dpi = 300)
+ggsave("forestplot_clinical_combined_borda_zscore.pdf",
+       combined, width = 11, height = combined_h)
+
+print(pA)
+print(pB)
+print(combined)
+
+cat("\nSaved:\n")
+cat("  forestplot_univariate_clinical_borda_zscore.png\n")
+cat("  forestplot_multivariate_clinical_borda_zscore.png\n")
+cat("  forestplot_clinical_combined_borda_zscore.png/.pdf\n")
+```
+
+
+
+#monogram
+```{r}
+library(rms)
+library(survival)
+library(dplyr)
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 1: Load data
+# ═══════════════════════════════════════════════════════════════════
+metadata <- read.csv("Metadata_Limma_dead_time_all.csv")
+risk_df  <- read.csv("RiskScore_results_borda_zscore.csv")     # UPDATED
+
+df <- metadata %>%
+  left_join(risk_df %>% select(SampleID, RiskScore, RiskGroup),
+            by = "SampleID") %>%
+  mutate(
+    age_bin     = factor(ifelse(Age == ">=60", ">=60", "<60"),
+                         levels = c("<60", ">=60")),
+    sex_bin     = factor(ifelse(sex == "Male", "Male", "Female"),
+                         levels = c("Female", "Male")),
+    smoking_bin = factor(ifelse(smoking == "never smoker",
+                                "Never", "Ever"),
+                         levels = c("Never", "Ever")),
+    stage_bin   = factor(ifelse(stage == 4, "IV", "III"),
+                         levels = c("III", "IV")),
+    adeno_bin   = factor(ifelse(histo_detail == "Adenocarcinoma",
+                                "Adeno", "Other"),
+                         levels = c("Other", "Adeno")),
+    os_months   = as.numeric(Time.Dead),                       # FIXED: renamed
+    os_status   = as.integer(dead.status)                      # FIXED: renamed
+  ) %>%
+  filter(!is.na(os_months), !is.na(RiskScore))
+
+cat("Samples:", nrow(df), "| Events:", sum(df$os_status), "\n")
+
+# ── Diagnostic: follow-up range ───────────────────────────────────
+cat("\nFollow-up time summary (months):\n")
+print(summary(df$os_months))
+cat("Max follow-up:", max(df$os_months), "months\n")
+
+cat("\nEvents at each candidate timepoint:\n")
+for (tp in c(6, 12, 18, 24, 36)) {
+  n_risk   <- sum(df$os_months >= tp)
+  n_events <- sum(df$os_status[df$os_months >= tp])
+  cat(sprintf("  ≥ %2d months: %d patients at risk, %d events\n",
+              tp, n_risk, n_events))
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 2: rms setup — datadist MUST be set before cph()
+# ═══════════════════════════════════════════════════════════════════
+dd <- datadist(df)
+options(datadist = "dd")
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 3: Fit Cox model using rms::cph
+# Include risk score + clinical variables that were sig in multivariate
+# Adjust var list based on your multivariate results
+# ═══════════════════════════════════════════════════════════════════
+fit <- cph(
+  Surv(os_months, os_status) ~ RiskScore + age_bin + sex_bin +
+                                smoking_bin + stage_bin + adeno_bin,
+  data    = df,
+  x       = TRUE,   # REQUIRED for nomogram + calibration
+  y       = TRUE,   # REQUIRED for nomogram + calibration
+  surv    = TRUE,   # REQUIRED for survival predictions
+  ties    = "efron"
+)
+
+cat("\n─── rms::cph model ───\n")
+print(fit)
+cat("\nC-index:", round(fit$stats["Dxy"] / 2 + 0.5, 3), "\n")
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 4: Define survival function — FIXED
+# ═══════════════════════════════════════════════════════════════════
+mean_lp <- mean(predict(fit))   # centering point
+
+surv_fn_lp <- function(tp, lp) {
+  sf <- survest(fit, times = tp, conf.int = FALSE)
+  s0 <- sf$surv[1]              # baseline survival at tp
+  s0^exp(lp - mean_lp)          # S(t|lp) = S0(t)^exp(lp - mean_lp)
+}
+
+lp_seq   <- seq(range(predict(fit))[1],
+                range(predict(fit))[2],
+                length.out = 200)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 5: Auto-select valid timepoints
+# ═══════════════════════════════════════════════════════════════════
+candidate_times  <- c(6, 12, 18, 24, 36)
+candidate_labels <- c("6-month OS", "1-year OS", "18-month OS",
+                      "2-year OS",  "3-year OS")
+
+valid_tp  <- c()
+valid_lbl <- c()
+
+for (i in seq_along(candidate_times)) {
+  tp  <- candidate_times[i]
+  n   <- sum(df$os_months >= tp)
+
+  sv <- tryCatch(
+    survest(fit, times = tp, what = "survival",
+            conf.int = FALSE)$surv,
+    error = function(e) NA
+  )
+
+  has_range <- !all(is.na(sv)) &&
+               (max(sv, na.rm = TRUE) - min(sv, na.rm = TRUE)) > 0.05
+
+  if (n >= 10 && has_range) {
+    valid_tp  <- c(valid_tp,  tp)
+    valid_lbl <- c(valid_lbl, candidate_labels[i])
+    cat(sprintf("  ✓ %d months: n=%d at risk, range=%.3f\u2013%.3f\n",
+                tp, n, min(sv, na.rm=TRUE), max(sv, na.rm=TRUE)))
+  } else {
+    cat(sprintf("  ✗ %d months: n=%d — excluded\n", tp, n))
+  }
+}
+
+# Use at most 3 timepoints
+if (length(valid_tp) > 3) {
+  valid_tp  <- valid_tp[1:3]
+  valid_lbl <- valid_lbl[1:3]
+}
+
+cat("\nSelected timepoints:", paste(valid_tp, "mo", collapse = ", "), "\n")
+
+if (length(valid_tp) == 0) {
+  stop("No valid timepoints. Check os_months values.")
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 6: Build fun.at list — robust to narrow ranges
+# ═══════════════════════════════════════════════════════════════════
+safe_fun_at <- function(tp, steps = 0.1) {
+  sv <- tryCatch(
+    survest(fit, times = tp, what = "survival",
+            conf.int = FALSE)$surv,
+    error = function(e) NA
+  )
+  sv <- sv[!is.na(sv) & is.finite(sv)]
+
+  if (length(sv) < 2) {
+    cat("  Warning: timepoint", tp, "< 2 valid values — using c(0.1, 0.9)\n")
+    return(c(0.1, 0.9))
+  }
+
+  lo <- ceiling(min(sv) / steps) * steps
+  hi <- floor(max(sv)   / steps) * steps
+
+  if (lo >= hi) {
+    return(round(seq(min(sv), max(sv), length.out = 5), 2))
+  }
+  round(seq(lo, hi, by = steps), 2)
+}
+
+fun_at_list <- lapply(valid_tp, safe_fun_at)
+
+cat("\nfun.at ranges:\n")
+for (i in seq_along(valid_tp)) {
+  cat(" ", valid_lbl[i], ":", fun_at_list[[i]], "\n")
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 7: Build nomogram — FIXED fun_list
+# ═══════════════════════════════════════════════════════════════════
+
+# fun_list: each function takes lp vector x → returns survival vector
+fun_list <- lapply(valid_tp, function(tp) {
+  local({
+    t <- tp
+    function(x) surv_fn_lp(t, x)   # FIXED: uses x (lp) correctly
+  })
+})
+
+# Rebuild fun_at_list using corrected surv_fn_lp
+safe_fun_at <- function(tp, steps = 0.1) {
+  sv <- surv_fn_lp(tp, lp_seq)
+  sv <- sv[!is.na(sv) & is.finite(sv)]
+
+  if (length(sv) < 2) {
+    cat("  Warning: timepoint", tp, "— using c(0.1, 0.9)\n")
+    return(c(0.1, 0.9))
+  }
+
+  lo <- ceiling(min(sv) / steps) * steps
+  hi <- floor(max(sv)   / steps) * steps
+
+  if (lo >= hi) {
+    return(round(seq(min(sv), max(sv), length.out = 5), 2))
+  }
+  round(seq(lo, hi, by = steps), 2)
+}
+
+fun_at_list <- lapply(valid_tp, safe_fun_at)
+
+cat("\nfun.at ranges:\n")
+for (i in seq_along(valid_tp)) {
+  cat(" ", valid_lbl[i], ":", fun_at_list[[i]], "\n")
+}
+
+nom <- nomogram(
+  fit,
+  fun      = fun_list,
+  funlabel = valid_lbl,
+  lp       = FALSE,
+  fun.at   = fun_at_list
+)
+
+cat("Nomogram built successfully\n")
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 8: Plot and save
+# ═══════════════════════════════════════════════════════════════════
+title_str <- sprintf(
+  "Nomogram for predicting overall survival\n3-miRNA risk score + clinical variables  (n = %d)",  # UPDATED
+  nrow(df)
+)
+
+# PNG
+png("Nomogram_3miRNA_borda_zscore.png",                        # UPDATED
+    width = 3400, height = 2200, res = 300)
+par(mar = c(2, 1, 3, 1), family = "sans")
+plot(nom,
+     xfrac              = 0.38,
+     label.every        = 1,
+     tcl                = -0.30,
+     lmgp               = 0.25,
+     col.grid           = gray(c(0.82, 0.93)),
+     varname.label      = TRUE,
+     varname.label.sep  = "= ",
+     cex.axis           = 0.75,
+     cex.var            = 0.82,
+     points.label       = "Points",
+     total.points.label = "Total points",
+     main               = title_str)
+dev.off()
+cat("Nomogram_3miRNA_borda_zscore.png saved\n")
+
+# PDF
+pdf("Nomogram_3miRNA_borda_zscore.pdf", width = 13, height = 8.5)  # UPDATED
+par(mar = c(2, 1, 3, 1), family = "sans")
+plot(nom,
+     xfrac              = 0.38,
+     label.every        = 1,
+     tcl                = -0.30,
+     lmgp               = 0.25,
+     col.grid           = gray(c(0.82, 0.93)),
+     varname.label      = TRUE,
+     cex.axis           = 0.75,
+     cex.var            = 0.82,
+     main               = title_str)
+dev.off()
+cat("Nomogram_3miRNA_borda_zscore.pdf saved\n")
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 9: Calibration curves
+# ═══════════════════════════════════════════════════════════════════
+n_tp <- length(valid_tp)
+
+png("Calibration_curves_3miRNA_borda_zscore.png",              # UPDATED
+    width  = 900 * n_tp,
+    height = 950,
+    res    = 300)
+par(mfrow = c(1, n_tp),
+    mar   = c(4.5, 4.5, 3.5, 1.5),
+    family = "sans")
+
+for (i in seq_along(valid_tp)) {
+  tp  <- valid_tp[i]
+  lbl <- valid_lbl[i]
+
+  cal <- tryCatch(
+    calibrate(fit, u = tp, B = 200, cmethod = "KM"),
+    error = function(e) {
+      message("Calibration failed for ", lbl, ": ", e$message)
+      NULL
+    }
+  )
+
+  if (!is.null(cal)) {
+    plot(cal,
+         xlim      = c(0, 1), ylim = c(0, 1),
+         xlab      = "Predicted probability",
+         ylab      = "Observed probability",
+         main      = paste0(lbl, " calibration"),
+         subtitles = FALSE,
+         col       = "steelblue", lwd = 1.5)
+    abline(0, 1, col = "grey50", lty = 2, lwd = 1)
+    legend("topleft",
+           legend = c("Calibration", "Ideal"),
+           col    = c("steelblue", "grey50"),
+           lty    = c(1, 2), lwd = c(1.5, 1),
+           bty    = "n", cex = 0.75)
+    cat("Calibration plotted:", lbl, "\n")
+  }
+}
+dev.off()
+cat("Calibration_curves_3miRNA_borda_zscore.png saved\n")
+
+cat("\n═══ Nomogram complete ═══\n")
+cat("Files saved:\n")
+cat("  Nomogram_3miRNA_borda_zscore.png/.pdf\n")
+cat("  Calibration_curves_3miRNA_borda_zscore.png\n")
+```
+
+
+
+
+#calculates risk score first, then correlates with all clinical variables:
+```{r}
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(ggpubr)
+library(tidyr)
+
+# ── 1. Load data ──────────────────────────────────────────────────────────
+combat  <- read.csv("combat_counts.csv", check.names = FALSE)
+meta    <- read.csv("Metadata_Limma_dead_time_all.csv")
+
+# ── 2. Calculate Risk Score ───────────────────────────────────────────────
+# Extract the 3 miRNAs (column names use dots)
+mir_cols <- c("hsa.miR.509.3p", "hsa.miR.377.3p", "hsa.miR.378h")
+
+expr <- combat[, c("SampleID", mir_cols)]
+
+# log2(x+1) transform then z-score each miRNA
+expr_z <- expr
+for (col in mir_cols) {
+  log_val         <- log2(expr[[col]] + 1)
+  expr_z[[col]]   <- as.numeric(scale(log_val))
+}
+
+# Apply Cox betas
+expr_z$risk_score <- (0.743073 * expr_z$hsa.miR.509.3p) +
+                     (0.502724 * expr_z$hsa.miR.377.3p)  +
+                    (-0.663259 * expr_z$hsa.miR.378h)
+
+# ── 3. Classify High / Low risk by median ────────────────────────────────
+expr_z$risk_group <- ifelse(expr_z$risk_score >= median(expr_z$risk_score),
+                             "High", "Low")
+
+# ── 4. Merge with metadata ────────────────────────────────────────────────
+df <- merge(meta, expr_z[, c("SampleID", "risk_score", "risk_group")],
+            by = "SampleID")
+
+write.csv(df, "metadata_with_risk_score.csv", row.names = FALSE)
+
+cat("High risk:", sum(df$risk_group == "High"), "\n")
+cat("Low risk: ", sum(df$risk_group == "Low"),  "\n")
+
+# ── 5. Boxplot: Risk Score Distribution ───────────────────────────────────
+p_dist <- ggplot(df, aes(x = risk_group, y = risk_score, fill = risk_group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.15, size = 2) +
+  stat_compare_means(method = "wilcox.test", label = "p.format") +
+  scale_fill_manual(values = c("High" = "#E15759", "Low" = "#4E79A7")) +
+  theme_classic() +
+  labs(title = "Risk Score Distribution",
+       x = "Risk Group", y = "Risk Score") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", hjust = 0.5))
+
+# ── 6. Clinical Correlations ──────────────────────────────────────────────
+
+# --- 6a. Sex ---
+p_sex <- ggplot(df, aes(x = sex, fill = risk_group)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("High" = "#E15759", "Low" = "#4E79A7")) +
+  theme_classic() +
+  labs(title = "Sex", x = NULL, y = "Proportion", fill = "Risk Group") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+# --- 6b. Smoking ---
+p_smoking <- ggplot(df, aes(x = smoking, fill = risk_group)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("High" = "#E15759", "Low" = "#4E79A7")) +
+  theme_classic() +
+  labs(title = "Smoking Status", x = NULL, y = "Proportion", fill = "Risk Group") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+# --- 6c. Histology ---
+p_histo <- ggplot(df, aes(x = histo_detail, fill = risk_group)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("High" = "#E15759", "Low" = "#4E79A7")) +
+  theme_classic() +
+  labs(title = "Histology", x = NULL, y = "Proportion", fill = "Risk Group") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+# --- 6d. AJCC Stage ---
+p_stage <- ggplot(df, aes(x = ajcc8_stage, fill = risk_group)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("High" = "#E15759", "Low" = "#4E79A7")) +
+  theme_classic() +
+  labs(title = "AJCC Stage", x = NULL, y = "Proportion", fill = "Risk Group") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+# --- 6e. Age ---
+p_age <- ggplot(df, aes(x = Age, fill = risk_group)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("High" = "#E15759", "Low" = "#4E79A7")) +
+  theme_classic() +
+  labs(title = "Age Group", x = NULL, y = "Proportion", fill = "Risk Group") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+# --- 6f. First-line treatment ---
+p_treat <- ggplot(df, aes(x = firstline_detail, fill = risk_group)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("High" = "#E15759", "Low" = "#4E79A7")) +
+  theme_classic() +
+  labs(title = "First-line Treatment", x = NULL, y = "Proportion", fill = "Risk Group") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+# --- 6g. Risk Score by Stage (continuous) ---
+p_stage_box <- ggplot(df, aes(x = ajcc8_stage, y = risk_score, fill = ajcc8_stage)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.15, size = 2) +
+  stat_compare_means(method = "kruskal.test", label = "p.format") +
+  theme_classic() +
+  labs(title = "Risk Score by AJCC Stage",
+       x = "AJCC Stage", y = "Risk Score") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", hjust = 0.5))
+
+# ── 7. Combine all plots ──────────────────────────────────────────────────
+final_clinical <- (p_dist | p_sex | p_smoking) /
+                  (p_histo | p_stage | p_age) /
+                  (p_treat | p_stage_box | plot_spacer()) +
+  plot_annotation(
+    title = "Risk Score — Clinical Correlations",
+    theme = theme(plot.title = element_text(size = 16, face = "bold",
+                                             hjust = 0.5, color = "#225577"))
+  )
+
+print(final_clinical)
+ggsave("Clinical_Correlation.png", final_clinical,
+       width = 18, height = 16, dpi = 300)
+
+# ── 8. Chi-square tests for categorical variables ─────────────────────────
+cat_vars <- c("sex", "smoking", "histo_detail", "ajcc8_stage", "Age", "firstline_detail")
+
+chi_results <- lapply(cat_vars, function(var) {
+  tbl <- table(df[[var]], df$risk_group)
+  test <- chisq.test(tbl, simulate.p.value = TRUE)
+  data.frame(Variable = var, p_value = round(test$p.value, 4))
+})
+
+chi_table <- do.call(rbind, chi_results)
+chi_table$Significant <- ifelse(chi_table$p_value < 0.05, "Yes", "No")
+
+print(chi_table)
+write.csv(chi_table, "clinical_chisq_results.csv", row.names = FALSE)
+```
+
+
+#new clinical plot
+```{r}
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(ggpubr)
+
+# ── 1. Load data ──────────────────────────────────────────────────────────
+combat <- read.csv("combat_counts.csv", check.names = FALSE)
+meta   <- read.csv("Metadata_Limma_dead_time_all.csv")
+
+# ── 2. Calculate Risk Score ───────────────────────────────────────────────
+mir_cols <- c("hsa.miR.509.3p", "hsa.miR.377.3p", "hsa.miR.378h")
+expr     <- combat[, c("SampleID", mir_cols)]
+
+for (col in mir_cols) {
+  log_val       <- log2(expr[[col]] + 1)
+  expr[[col]]   <- as.numeric(scale(log_val))
+}
+
+expr$risk_score <- (0.743073 * expr$hsa.miR.509.3p) +
+                   (0.502724 * expr$hsa.miR.377.3p)  +
+                  (-0.663259 * expr$hsa.miR.378h)
+
+expr$risk_group <- ifelse(expr$risk_score >= median(expr$risk_score),
+                           "High", "Low")
+
+# ── 3. Merge with metadata ────────────────────────────────────────────────
+df <- merge(meta, expr[, c("SampleID", "risk_score", "risk_group")],
+            by = "SampleID")
+
+# ── 4. Reclassify clinical variables ─────────────────────────────────────
+
+# Smoking: never vs ever
+df$smoking_group <- ifelse(df$smoking == "never smoker", "Never", "Ever")
+df$smoking_group <- factor(df$smoking_group, levels = c("Never", "Ever"))
+
+# Histology: Adeno / Squamous / Other
+df$histo_group <- case_when(
+  df$histo_detail == "Adenocarcinoma"         ~ "Adeno",
+  df$histo_detail == "Squamous cell carcinoma" ~ "Squamous",
+  TRUE                                         ~ "Other"
+)
+df$histo_group <- factor(df$histo_group, levels = c("Adeno", "Squamous", "Other"))
+
+# Stage: III vs IV
+df$stage_group <- ifelse(grepl("^III", df$ajcc8_stage), "Stage III", "Stage IV")
+df$stage_group <- factor(df$stage_group, levels = c("Stage III", "Stage IV"))
+
+# Treatment: Chemo / Immuno / Chemo+Immuno, from the first-line treatment category
+# (GEO characteristic; regimen names are not shared)
+df$treat_group <- case_when(
+  df$firstline_category == "immunotherapy"                          ~ "Immuno",
+  df$firstline_category == "chemotherapy followed by immunotherapy" ~ "Chemo+Immuno",
+  TRUE                                                              ~ "Chemo"
+)
+df$treat_group <- factor(df$treat_group, levels = c("Chemo", "Immuno", "Chemo+Immuno"))
+
+# Save classified data
+write.csv(df, "metadata_with_risk_score.csv", row.names = FALSE)
+
+# ── 5. Color palette ──────────────────────────────────────────────────────
+risk_colors <- c("High" = "#E15759", "Low" = "#4E79A7")
+
+# ── 6. Plot function (stacked bar) ────────────────────────────────────────
+make_bar_plot <- function(data, x_var, title) {
+  ggplot(data, aes(x = .data[[x_var]], fill = risk_group)) +
+    geom_bar(position = "fill", width = 0.6) +
+    scale_fill_manual(values = risk_colors) +
+    scale_y_continuous(labels = scales::percent) +
+    theme_classic() +
+    labs(title = title, x = NULL, y = "Proportion", fill = "Risk Group") +
+    theme(plot.title    = element_text(face = "bold", hjust = 0.5, size = 11),
+          axis.text.x   = element_text(size = 10),
+          legend.position = "right")
+}
+
+# ── 7. Individual plots ───────────────────────────────────────────────────
+
+# Risk score distribution
+p_dist <- ggplot(df, aes(x = risk_group, y = risk_score, fill = risk_group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7, width = 0.5) +
+  geom_jitter(width = 0.15, size = 2.5) +
+  stat_compare_means(method = "wilcox.test", label = "p.format", size = 4) +
+  scale_fill_manual(values = risk_colors) +
+  theme_classic() +
+  labs(title = "Risk Score Distribution", x = "Risk Group", y = "Risk Score") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", hjust = 0.5, size = 11))
+
+p_smoking <- make_bar_plot(df, "smoking_group", "Smoking Status")
+p_histo   <- make_bar_plot(df, "histo_group",   "Histology")
+p_stage   <- make_bar_plot(df, "stage_group",   "Clinical Stage")
+p_treat   <- make_bar_plot(df, "treat_group",   "First-line Treatment")
+
+# Risk score by stage (continuous)
+p_stage_box <- ggplot(df, aes(x = stage_group, y = risk_score, fill = stage_group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7, width = 0.5) +
+  geom_jitter(width = 0.15, size = 2.5) +
+  stat_compare_means(method = "wilcox.test", label = "p.format", size = 4) +
+  scale_fill_manual(values = c("Stage III" = "#59A14F", "Stage IV" = "#F28E2B")) +
+  theme_classic() +
+  labs(title = "Risk Score by Stage", x = NULL, y = "Risk Score") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", hjust = 0.5, size = 11))
+
+# ── 8. Combine ────────────────────────────────────────────────────────────
+final_plot <- (p_dist | p_smoking | p_histo) /
+              (p_stage | p_treat  | p_stage_box) +
+  plot_annotation(
+    title = "Risk Score — Clinical Correlations",
+    theme = theme(plot.title = element_text(size = 16, face = "bold",
+                                             hjust = 0.5, color = "#225577"))
+  )
+
+print(final_plot)
+ggsave("Clinical_Correlation.png", final_plot,
+       width = 16, height = 12, dpi = 300)
+
+# ── 9. Chi-square tests ───────────────────────────────────────────────────
+cat_vars <- list(
+  "Smoking"   = "smoking_group",
+  "Histology" = "histo_group",
+  "Stage"     = "stage_group",
+  "Treatment" = "treat_group",
+  "Sex"       = "sex",
+  "Age"       = "Age"
+)
+
+chi_results <- lapply(names(cat_vars), function(label) {
+  var  <- cat_vars[[label]]
+  tbl  <- table(df[[var]], df$risk_group)
+  test <- chisq.test(tbl, simulate.p.value = TRUE)
+  data.frame(Variable    = label,
+             p_value     = round(test$p.value, 4),
+             Significant = ifelse(test$p.value < 0.05, "Yes", "No"))
+})
+
+chi_table <- do.call(rbind, chi_results)
+print(chi_table)
+write.csv(chi_table, "clinical_chisq_results.csv", row.names = FALSE)
+```
+
+
+
+
+
+
+
+
