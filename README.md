@@ -1,5 +1,9 @@
 # Code for: Plasma Extracellular Vesicle-Derived MicroRNAs Associated with Overall Survival in Advanced Non-Targeted NSCLC: A Pilot Study
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23796252.svg)](https://doi.org/10.5281/zenodo.23796252)
+
+Archived version: v1.0.0, https://doi.org/10.5281/zenodo.23796252
+
 Manuscript CTS-2026-0503, *Clinical and Translational Science*.
 Panvongsa W, Oranratnachai S, Trachu N, Khiewngam K, Monnamo N, Reungwetwattana T, Chairoungdua A.
 
